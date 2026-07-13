@@ -1,0 +1,22 @@
+[package]
+name = "vivy-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Core vector index engine for Vivy — single-machine, memory-honest vector search"
+
+[dependencies]
+fastrand = "2"
+ordered-float = { version = "4", features = ["std"] }
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2"
+log = "0.4"
+roaring = "0.10"
+rayon = "1"
+rand = "0.9"
+arc-swap = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

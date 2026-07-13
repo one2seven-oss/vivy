@@ -1,0 +1,15 @@
+[package]
+name = "vivy-py"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings for Vivy vector search engine"
+
+[dependencies]
+vivy-core = { path = "../lib" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+
+[lib]
+name = "vivy_py"
+crate-type = ["cdylib"]
