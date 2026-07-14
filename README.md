@@ -1,7 +1,4 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="vivy.svg">
-  <img src="vivy.svg" alt="Vivy" width="200">
-</picture>
+<img src="assets/vivy.png" alt="Vivy" width="200">
 
 [![CI](https://github.com/anomalyco/vivy/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/vivy/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
