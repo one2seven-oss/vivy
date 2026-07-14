@@ -57,7 +57,7 @@ impl VivyIndex {
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
     ) -> Result<Self, WalError> {
-        let wal = wal_path.as_ref().map(|p| WalWriter::open(p)).transpose()?.map(Mutex::new);
+        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?.map(Mutex::new);
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
 
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =

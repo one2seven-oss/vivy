@@ -35,7 +35,7 @@ impl ProductQuantizer {
     // Training cost: ~20 × N × D × 256 f32 ops — ~30-60s for 1M×768 on modern CPU.
     // Done during compaction, not at query time.
     pub fn train(data: &[f32], dims: usize, num_subvectors: usize) -> Self {
-        assert!(dims % num_subvectors == 0, "dims must be divisible by num_subvectors");
+        assert!(dims.is_multiple_of(num_subvectors), "dims must be divisible by num_subvectors");
         let subdim = dims / num_subvectors;
         let n = data.len() / dims;
         let num_centroids = 256usize;
@@ -148,9 +148,9 @@ fn train_kmeans(data: &[f32], subdim: usize, k: usize, max_iter: usize) -> Vec<f
 
     for _ in 0..max_iter {
         let mut changed = false;
-        for i in 0..n {
+        for (i, label) in labels.iter_mut().enumerate() {
             let base = i * subdim;
-            let mut best = labels[i];
+            let mut best = *label;
             let mut best_d = l2_sq(&data[base..base + subdim], &centroids[best * subdim..(best + 1) * subdim]);
             for c in 0..k {
                 let d = l2_sq(&data[base..base + subdim], &centroids[c * subdim..(c + 1) * subdim]);
@@ -160,7 +160,7 @@ fn train_kmeans(data: &[f32], subdim: usize, k: usize, max_iter: usize) -> Vec<f
                     changed = true;
                 }
             }
-            labels[i] = best;
+            *label = best;
         }
         if !changed {
             break;
@@ -168,9 +168,8 @@ fn train_kmeans(data: &[f32], subdim: usize, k: usize, max_iter: usize) -> Vec<f
 
         let mut sums = vec![vec![0.0f32; subdim]; k];
         let mut counts = vec![0usize; k];
-        for i in 0..n {
+        for (i, &c) in labels.iter().enumerate() {
             let base = i * subdim;
-            let c = labels[i];
             counts[c] += 1;
             for j in 0..subdim {
                 sums[c][j] += data[base + j];

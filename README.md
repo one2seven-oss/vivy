@@ -1,9 +1,21 @@
-# Vivy
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="vivy.svg">
+  <img src="vivy.svg" alt="Vivy" width="200">
+</picture>
+
+[![CI](https://github.com/anomalyco/vivy/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/vivy/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
+[![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
 
 Single-machine vector search that fits in memory.
 
 HNSW graph index with optional product quantization, metadata filtering,
 and crash-safe WAL. Spun from a Python REPL or embedded in Rust.
+
+> **[Full documentation → DOCS.md](DOCS.md)** — detailed API reference, examples,
+> edge cases, performance tuning, and Rust API.
 
 ## Quick start
 
@@ -101,3 +113,4 @@ cargo run --release --bin vivy-bench
 Reports recall@10 vs brute force, QPS, and mean latency on random 64-dim
 data. Run it unoptimised first — the gap between debug and release builds is
 substantial.
+

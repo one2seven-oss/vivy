@@ -236,11 +236,13 @@ impl SealedSegment {
     }
 }
 
+type NodeEntry = (u64, u32, Vec<Vec<u32>>, Vec<f32>);
+
 // Builder for sealed segment files. Push nodes, then write() to finalise.
 pub struct SegmentWriter<W: std::io::Write + std::io::Seek> {
     inner: W,
     header: Header,
-    nodes: Vec<(u64, u32, Vec<Vec<u32>>, Vec<f32>)>,
+    nodes: Vec<NodeEntry>,
 }
 
 impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
@@ -285,7 +287,7 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
         let mut offsets = Vec::with_capacity(num_nodes);
         for (id, level, neighbors, vector) in &self.nodes {
             let off = self.inner.stream_position()? - node_data_start;
-            offsets.push(off as u64);
+            offsets.push(off);
             self.inner.write_all(&id.to_le_bytes())?;
             self.inner.write_all(&level.to_le_bytes())?;
             for layer in neighbors {

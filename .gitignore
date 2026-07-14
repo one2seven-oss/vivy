@@ -2,3 +2,8 @@
 *.pyc
 __pycache__/
 *.egg-info/
+*.so
+.venv/
+venv/
+.DS_Store
+*.o
