@@ -15,7 +15,11 @@ pub struct FlatIndex {
 
 impl FlatIndex {
     pub fn new(metric: Metric) -> Self {
-        Self { vectors: Vec::new(), ids: Vec::new(), metric }
+        Self {
+            vectors: Vec::new(),
+            ids: Vec::new(),
+            metric,
+        }
     }
 
     // IDs need not be unique, but duplicate IDs make distance_to() undefined.

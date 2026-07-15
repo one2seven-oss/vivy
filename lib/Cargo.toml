@@ -17,6 +17,7 @@ rayon = "1"
 rand = "0.9"
 arc-swap = "1"
 parking_lot = "0.12"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

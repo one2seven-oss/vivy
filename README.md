@@ -42,32 +42,44 @@ Search latency is measured in microseconds, not milliseconds.
 ## Architecture
 
 ```
-          Python           Rust 
+          Python           Rust
              │               │
     ┌────────┴──────┐  ┌─────┴──────┐
     │ PyO3 bindings │  │  VivyIndex │
     └────────┬──────┘  └──────┬─────┘
              │                │
-    ┌────────┴────────────────┴─────┐
-    │         Delta (HNSW)          │  ← mutable, write-locked
-    ├───────────────────────────────┤
-    │  Sealed Segment 1  (mmap)     │  ← immutable
-    │  Sealed Segment 2  (mmap)     │
-    │  ...                          │
-    └───────────────────────────────┘
+    ┌────────┴────────────────┴──────────┐
+    │  Pending buffer  (batch up to 64)  │  ← Mutex, never blocks writers
+    ├────────────────────────────────────┤
+    │  WAL worker     (background fsync) │  ← bounded channel, non-blocking
+    ├────────────────────────────────────┤
+    │  Delta (HNSW)  (batched writes)    │  ← RwLock, 1 lock per 64 inserts
+    ├────────────────────────────────────┤
+    │  Sealed Segment 1  (mmap)          │  ← immutable
+    │  Sealed Segment 2  (mmap)          │
+    │  ...                               │
+    └────────────────────────────────────┘
 ```
 
-- **Delta segment**: HNSW graph in memory. New inserts go here. Small (~10K
-  vectors before compaction), so writes stay fast and contention stays low.
+- **Pending buffer**: New inserts land here under a lightweight `Mutex`, then
+  flush to the delta in batches of 64. A write lock is acquired once per batch
+  instead of once per insert — inserts become essentially lock-free from the
+  search path's perspective.
+- **WAL worker**: Append+fsync runs in a dedicated thread via a bounded
+  `crossbeam_channel`. The insert path sends entries with `try_send` and never
+  stalls on disk I/O.
+- **Delta segment**: HNSW graph in memory. Receives batched writes from the
+  pending buffer. Small (~10K vectors before compaction).
 - **Sealed segments**: Immutable files on disk, memory-mapped. No locks.
-  Scanned linearly (small enough that it doesn't matter — see *When Vivy is
-  fast enough* below).
-- **Compactor**: Background thread that freezes the delta when it overflows,
-  writes it to a sealed segment, and atomically swaps it into the search path
-  via `arc_swap`. Polls every 5 seconds.
+  Scanned linearly.
+- **Search**: Snapshots delta entries under a brief read lock, releases it,
+  then searches the snapshot + sealed segments. No lock held during distance
+  computation.
+- **Compactor**: Background thread that flushes the pending buffer, freezes
+  the delta on overflow, writes a sealed segment, and atomically swaps it
+  into the search path via `arc_swap`. Polls every 5 seconds.
 - **Filter index**: Roaring bitmap per (field, value) pair. Filters are
-  pushed into the HNSW search when selective; otherwise applied as a
-  post-filter.
+  applied as a post-filter on the delta snapshot and sealed segment scan.
 
 ## Indexes
 

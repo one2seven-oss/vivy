@@ -34,10 +34,10 @@ pub struct HnswIndex {
     entry: Option<usize>,
     max_level: usize,
 
-    m: usize,            // connections per layer (M_max = 2*M at layer 0)
+    m: usize, // connections per layer (M_max = 2*M at layer 0)
     m_max: usize,
     ef_construction: usize,
-    ml: f32,             // 1/ln(M) for level generation
+    ml: f32, // 1/ln(M) for level generation
 
     metric: Metric,
 }
@@ -51,7 +51,9 @@ struct Candidate {
 
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.dist.cmp(&other.dist).then_with(|| self.idx.cmp(&other.idx))
+        self.dist
+            .cmp(&other.dist)
+            .then_with(|| self.idx.cmp(&other.idx))
     }
 }
 
@@ -171,10 +173,16 @@ impl HnswIndex {
         let ed = distance::compute(self.metric, query, &self.vectors[entry]);
 
         let mut candidates = BinaryHeap::new();
-        candidates.push(Candidate { dist: OrderedFloat(ed), idx: entry });
+        candidates.push(Candidate {
+            dist: OrderedFloat(ed),
+            idx: entry,
+        });
 
         let mut results = BinaryHeap::new();
-        results.push(Candidate { dist: OrderedFloat(ed), idx: entry });
+        results.push(Candidate {
+            dist: OrderedFloat(ed),
+            idx: entry,
+        });
 
         while let Some(c) = candidates.pop() {
             let furthest = results.peek().unwrap().dist;
@@ -211,7 +219,12 @@ impl HnswIndex {
     fn trim(&self, node: usize, layer: usize) -> Vec<usize> {
         let mut v: Vec<(usize, f32)> = self.neighbors[node][layer]
             .iter()
-            .map(|&n| (n, distance::compute(self.metric, &self.vectors[node], &self.vectors[n])))
+            .map(|&n| {
+                (
+                    n,
+                    distance::compute(self.metric, &self.vectors[node], &self.vectors[n]),
+                )
+            })
             .collect();
         v.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         v.truncate(self.m_max);
@@ -220,6 +233,14 @@ impl HnswIndex {
 
     pub fn metric(&self) -> Metric {
         self.metric
+    }
+
+    pub fn snapshot(&self) -> Vec<(u64, Vec<f32>)> {
+        self.ids
+            .iter()
+            .copied()
+            .zip(self.vectors.iter().cloned())
+            .collect()
     }
 
     // Drains the index to empty. Used by the compactor to move delta entries to sealed segments.

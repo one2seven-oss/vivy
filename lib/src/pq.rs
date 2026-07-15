@@ -23,8 +23,8 @@ use rayon::prelude::*;
 
 // A trained Product Quantizer: encode, decode, build ADC tables, compute ADC distances.
 pub struct ProductQuantizer {
-    pub num_subvectors: usize,  // M
-    pub subdim: usize,          // D / M
+    pub num_subvectors: usize, // M
+    pub subdim: usize,         // D / M
     // codebook[subvec][centroid * subdim .. (centroid+1) * subdim]
     pub codebook: Vec<Vec<f32>>,
 }
@@ -35,7 +35,10 @@ impl ProductQuantizer {
     // Training cost: ~20 × N × D × 256 f32 ops — ~30-60s for 1M×768 on modern CPU.
     // Done during compaction, not at query time.
     pub fn train(data: &[f32], dims: usize, num_subvectors: usize) -> Self {
-        assert!(dims.is_multiple_of(num_subvectors), "dims must be divisible by num_subvectors");
+        assert!(
+            dims.is_multiple_of(num_subvectors),
+            "dims must be divisible by num_subvectors"
+        );
         let subdim = dims / num_subvectors;
         let n = data.len() / dims;
         let num_centroids = 256usize;
@@ -58,7 +61,11 @@ impl ProductQuantizer {
             })
             .collect();
 
-        Self { num_subvectors, subdim, codebook }
+        Self {
+            num_subvectors,
+            subdim,
+            codebook,
+        }
     }
 
     // For each subvector, find nearest centroid → M bytes of PQ codes.
@@ -111,14 +118,24 @@ impl ProductQuantizer {
 
     // O(M) — one table lookup per subvector. Table must match query (build_adc_table).
     pub fn adc_distance(table: &[Vec<f32>], codes: &[u8]) -> f32 {
-        codes.iter().enumerate().map(|(sv, &code)| table[sv][code as usize]).sum()
+        codes
+            .iter()
+            .enumerate()
+            .map(|(sv, &code)| table[sv][code as usize])
+            .sum()
     }
 }
 
 // Same as distance::l2_squared but local to avoid module coupling concerns.
 // ponytail: swap for aliased SIMD version once distance::l2_squared gains acceleration.
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| { let d = x - y; d * d }).sum()
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
 }
 
 // Lloyd's algorithm, k=256. Forgy init (random distinct vectors). If k > n,
@@ -151,9 +168,15 @@ fn train_kmeans(data: &[f32], subdim: usize, k: usize, max_iter: usize) -> Vec<f
         for (i, label) in labels.iter_mut().enumerate() {
             let base = i * subdim;
             let mut best = *label;
-            let mut best_d = l2_sq(&data[base..base + subdim], &centroids[best * subdim..(best + 1) * subdim]);
+            let mut best_d = l2_sq(
+                &data[base..base + subdim],
+                &centroids[best * subdim..(best + 1) * subdim],
+            );
             for c in 0..k {
-                let d = l2_sq(&data[base..base + subdim], &centroids[c * subdim..(c + 1) * subdim]);
+                let d = l2_sq(
+                    &data[base..base + subdim],
+                    &centroids[c * subdim..(c + 1) * subdim],
+                );
                 if d < best_d {
                     best_d = d;
                     best = c;

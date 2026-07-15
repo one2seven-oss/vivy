@@ -35,25 +35,29 @@ pub struct FilterIndex {
 
 impl FilterIndex {
     pub fn new() -> Self {
-        Self { index: HashMap::new() }
+        Self {
+            index: HashMap::new(),
+        }
     }
 
     // Insert id → bitmap[field][value]. Idempotent if already set.
     pub fn insert(&mut self, id: u64, field: &str, value: &str) {
         let field_map = self.index.entry(field.to_string()).or_default();
-        field_map.entry(value.to_string()).or_default().insert(id as u32);
+        field_map
+            .entry(value.to_string())
+            .or_default()
+            .insert(id as u32);
     }
 
     // Evaluate the expression tree bottom-up.
     pub fn evaluate(&self, expr: &FilterExpr) -> RoaringBitmap {
         match expr {
-            FilterExpr::Equals { field, value } => {
-                self.index
-                    .get(field)
-                    .and_then(|m| m.get(value))
-                    .cloned()
-                    .unwrap_or_default()
-            }
+            FilterExpr::Equals { field, value } => self
+                .index
+                .get(field)
+                .and_then(|m| m.get(value))
+                .cloned()
+                .unwrap_or_default(),
             FilterExpr::In { field, values } => {
                 let mut result = RoaringBitmap::new();
                 if let Some(field_map) = self.index.get(field) {
@@ -143,7 +147,10 @@ mod tests {
         fi.insert(2, "color", "blue");
         fi.insert(3, "color", "red");
 
-        let expr = FilterExpr::Equals { field: "color".into(), value: "red".into() };
+        let expr = FilterExpr::Equals {
+            field: "color".into(),
+            value: "red".into(),
+        };
         let result = fi.evaluate(&expr);
         assert!(result.contains(1));
         assert!(result.contains(3));
@@ -161,8 +168,14 @@ mod tests {
         fi.insert(3, "color", "blue");
 
         let expr = FilterExpr::And(vec![
-            FilterExpr::Equals { field: "color".into(), value: "red".into() },
-            FilterExpr::Equals { field: "size".into(), value: "large".into() },
+            FilterExpr::Equals {
+                field: "color".into(),
+                value: "red".into(),
+            },
+            FilterExpr::Equals {
+                field: "size".into(),
+                value: "large".into(),
+            },
         ]);
         let result = fi.evaluate(&expr);
         assert_eq!(result.len(), 1);
@@ -176,7 +189,10 @@ mod tests {
         for i in 1..=100 {
             fi.insert(i, "group", if i % 2 == 0 { "even" } else { "odd" });
         }
-        let expr = FilterExpr::Equals { field: "group".into(), value: "even".into() };
+        let expr = FilterExpr::Equals {
+            field: "group".into(),
+            value: "even".into(),
+        };
         let sel = fi.selectivity(&expr);
         assert!((sel - 0.5).abs() < 0.01);
     }

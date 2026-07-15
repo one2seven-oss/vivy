@@ -135,7 +135,11 @@ impl WalWriter {
                     f(WalEntry::Flush);
                 }
                 tag => {
-                    warn!("WAL replay: unknown tag {:#04x} at offset {}, stopping", tag, off - 1);
+                    warn!(
+                        "WAL replay: unknown tag {:#04x} at offset {}, stopping",
+                        tag,
+                        off - 1
+                    );
                     return Err(WalError::Corrupt(off - 1));
                 }
             }
@@ -155,7 +159,11 @@ mod tests {
 
         {
             let mut wal = WalWriter::open(&path).unwrap();
-            wal.append(&WalEntry::Insert { id: 1, vector: vec![1.0, 2.0, 3.0] }).unwrap();
+            wal.append(&WalEntry::Insert {
+                id: 1,
+                vector: vec![1.0, 2.0, 3.0],
+            })
+            .unwrap();
             wal.append(&WalEntry::Delete { id: 2 }).unwrap();
             wal.append(&WalEntry::Flush).unwrap();
             wal.commit().unwrap();

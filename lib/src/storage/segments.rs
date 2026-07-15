@@ -177,7 +177,9 @@ impl SealedSegment {
             return None;
         }
         let len = self.pq_subvectors * 256 * size_of::<f32>();
-        Some(bytemuck::cast_slice(&self.mmap[self.codebook_off..self.codebook_off + len]))
+        Some(bytemuck::cast_slice(
+            &self.mmap[self.codebook_off..self.codebook_off + len],
+        ))
     }
 
     // Read full node: id, level, neighbours, PQ code or vector.
@@ -219,7 +221,13 @@ impl SealedSegment {
             (None, Some(v))
         };
 
-        Ok(NodeRecord { id, level: level as u32, neighbors, pq_code, vector })
+        Ok(NodeRecord {
+            id,
+            level: level as u32,
+            neighbors,
+            pq_code,
+            vector,
+        })
     }
 
     // Fast-path: PQ code only, skips adjacency lists. For ADC-based search.
@@ -258,7 +266,11 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
             pq_enabled: 0,
             _reserved: [0u8; 31],
         };
-        Self { inner: writer, header, nodes: Vec::new() }
+        Self {
+            inner: writer,
+            header,
+            nodes: Vec::new(),
+        }
     }
 
     // Buffer a node: id, level, per-layer neighbours, vector.
@@ -297,7 +309,8 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
                 }
             }
             let vbytes: &[u8] = bytemuck::cast_slice(vector.as_slice());
-            self.inner.write_all(&vbytes[..self.header.dims as usize * 4])?;
+            self.inner
+                .write_all(&vbytes[..self.header.dims as usize * 4])?;
         }
 
         let end_pos = self.inner.stream_position()?;

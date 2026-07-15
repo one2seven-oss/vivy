@@ -325,7 +325,9 @@ assert len(idx) == 2
 
 ### Tips
 
-- **Batch inserts** when possible — each insert is O(log n) for HNSW.
+- **Batch inserts** when possible — use `insert_batch` (Rust) or bulk-insert in
+  a loop (Python). Batched inserts acquire the delta write lock once for the
+  entire batch instead of once per vector.
 - **Use cosine** for text embeddings (OpenAI, SBERT, etc.).
 - **Use L2** when absolute distance matters (recommendation, geospatial).
 - **Use metadata filters** sparingly on large datasets — they add bitmap
@@ -374,6 +376,10 @@ Rust API features not available from Python:
 | Filter expression AST (Or, Not, In) | `vivy_core::filter::FilterExpr` |
 | Write-Ahead Log | `vivy_core::storage::wal::WalWriter` |
 | Sealed segment I/O | `vivy_core::storage::segments` |
+| Batch insert | `VivyIndex::insert_batch(vectors)` |
+| Non-blocking WAL (background fsync) | built into `VivyIndex` via `wal_path` |
+| Pending-buffer batching (64 inserts per write lock) | built into `VivyIndex` |
+| Snapshot-based search (no lock held during distance computation) | built into `VivyIndex` |
 | Persistence + compaction | `VivyIndex::new(metric, wal_path, data_dir)` |
 
 ---
@@ -403,4 +409,7 @@ Python bindings currently only expose insert/search.
 
 **Q: Is Vivy thread-safe from Python?**  
 A: Yes. The GIL is released during insert/search, so multiple Python threads
-can operate on the same index concurrently.
+can operate on the same index concurrently. Inserts do not block searches:
+WAL fsync runs on a background thread, writes to the delta are batched
+(one write lock per 64 inserts), and search snapshots the delta under a
+brief read lock with no lock held during distance computation.

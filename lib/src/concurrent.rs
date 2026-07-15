@@ -1,47 +1,50 @@
-//! Segment-based concurrency model.
+//! Segment-based concurrency model with non-blocking inserts.
 //!
-//! Thread-safe VivyIndex combining three ideas for concurrent reads during writes:
+//! Thread-safe VivyIndex combinin four ideas for concurrent reads during writes:
 //!
-//! 1. **Delta/Sealed split** — new vectors go into a small in-memory delta
-//!    (RwLock-protected, tiny → negligible contention). When it exceeds a
-//!    threshold, it's frozen, serialised to an immutable sealed segment on
-//!    disk, and atomically swapped into the search path via arc-swap.
+//! 1. **Delta/Pending split** — new vectors go into a small pending buffer,
+//!    flushed in batches to the delta (RwLock). When delta exceeds a threshold,
+//!    it's serialised to an immutable sealed segment and atomically swapped
+//!    into the read path via arc-swap.
 //!
-//! 2. **Read-side fan-out** — every search queries the delta (read lock,
-//!    doesn't block other readers) AND all sealed segments (immutable,
-//!    no lock). Results are merged and top-k returned.
+//! 2. **Read-side snapshot** — every search copies delta entries under a brief
+//!    read lock, releases it, then searches the snapshot + sealed segments.
+//!    No lock held during distance computation.
 //!
-//! 3. **Background compactor** — monitors delta size, triggers compaction,
-//!    writes to a sealed segment file, atomically adds to the sealed list.
+//! 3. **Background WAL worker** — WAL append+fsync runs in a dedicated thread
+//!    via a bounded channel, decoupled from the insert path.
 //!
-//! True lock-free concurrent mutation of a single HNSW graph is an open
-//! research problem. This is the LSM-tree / Lucene approach: write to a
-//! small mutable buffer, read from buffer + all immutable buffers, merge
-//! in background. The only lock-free component is arc-swap for the sealed
-//! list pointer. Everything else uses standard RwLock scoped to the tiny
-//! delta, so contention is negligible.
+//! 4. **Background compactor** — monitors delta size, triggers compaction,
+//!    writes sealed segments to disk.
 
 use crate::distance::{self, Metric};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
-use crate::storage::wal::{WalEntry, WalWriter, WalError};
+use crate::storage::wal::{WalEntry, WalError, WalWriter};
 use arc_swap::ArcSwap;
+use crossbeam_channel;
 use log::{info, warn};
-use parking_lot::{RwLock, Mutex};
+use parking_lot::{Mutex, RwLock};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-// Top-level thread-safe index. Python (PyO3) and Rust apps interact with this.
+struct PendingInsert {
+    id: u64,
+    vector: Vec<f32>,
+}
+
 pub struct VivyIndex {
     delta: Arc<RwLock<HnswIndex>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     filter_index: RwLock<FilterIndex>,
-    wal: Option<Mutex<WalWriter>>,
+    wal_sender: Option<crossbeam_channel::Sender<WalEntry>>,
+    wal_handle: Option<thread::JoinHandle<()>>,
+    pending: Arc<Mutex<Vec<PendingInsert>>>,
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     next_id: AtomicU64,
@@ -49,74 +52,103 @@ pub struct VivyIndex {
 }
 
 impl VivyIndex {
-    // metric: distance metric for all comparisons.
-    // wal_path: optional WAL path for crash durability.
-    // data_dir: optional directory for sealed segments (None = in-RAM only).
     pub fn new(
         metric: Metric,
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
     ) -> Result<Self, WalError> {
-        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?.map(Mutex::new);
+        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
 
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
             Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
+        let (wal_sender, wal_handle) = if let Some(writer) = wal {
+            let (tx, rx) = crossbeam_channel::bounded(4096);
+            let h = thread::Builder::new()
+                .name("vivy-wal".into())
+                .spawn(move || wal_worker_loop(rx, writer))
+                .expect("WAL worker thread");
+            (Some(tx), Some(h))
+        } else {
+            (None, None)
+        };
+
+        let pending = Arc::new(Mutex::new(Vec::new()));
+
         let mut idx = Self {
             delta: Arc::new(RwLock::new(HnswIndex::new(metric))),
             sealed: sealed.clone(),
             filter_index: RwLock::new(FilterIndex::new()),
-            wal,
+            wal_sender,
+            wal_handle,
+            pending: pending.clone(),
             running: Arc::new(AtomicBool::new(true)),
             handle: None,
             next_id: AtomicU64::new(1),
             data_dir,
         };
 
-        // Background compactor: watches delta size, triggers compaction.
         let running = idx.running.clone();
         let delta = idx.delta.clone();
+        let pending = pending;
         let sealed = idx.sealed.clone();
         let dir = idx.data_dir.clone();
         let m = metric;
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, delta, sealed, dir, m))
+            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m))
             .expect("compactor thread");
         idx.handle = Some(h);
 
         Ok(idx)
     }
 
-    // Insert with auto-assigned ID. If WAL is enabled, it's fsynced before the delta update.
     pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(ref wal_mutex) = self.wal {
-            let mut wal = wal_mutex.lock();
-            wal.append(&WalEntry::Insert { id, vector: vector.clone() })?;
-            wal.commit()?;
+        if let Some(ref sender) = self.wal_sender {
+            let _ = sender.try_send(WalEntry::Insert {
+                id,
+                vector: vector.clone(),
+            });
         }
 
-        self.delta.write().insert(id, vector);
+        let mut pending = self.pending.lock();
+        pending.push(PendingInsert { id, vector });
+        if pending.len() >= 64 {
+            let batch = std::mem::take(&mut *pending);
+            drop(pending);
+            let mut delta = self.delta.write();
+            for ins in batch {
+                delta.insert(ins.id, ins.vector);
+            }
+        }
         Ok(id)
     }
 
-    // Insert with caller-specified ID. For WAL replay or external ID sync.
-    // Caller must ensure uniqueness; duplicates cause undefined filter behaviour.
     pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), WalError> {
-        if let Some(ref wal_mutex) = self.wal {
-            let mut wal = wal_mutex.lock();
-            wal.append(&WalEntry::Insert { id, vector: vector.clone() })?;
-            wal.commit()?;
+        if let Some(ref sender) = self.wal_sender {
+            let _ = sender.try_send(WalEntry::Insert {
+                id,
+                vector: vector.clone(),
+            });
         }
-        self.delta.write().insert(id, vector);
+
+        let mut pending = self.pending.lock();
+        pending.push(PendingInsert { id, vector });
+        if pending.len() >= 64 {
+            let batch = std::mem::take(&mut *pending);
+            drop(pending);
+            let mut delta = self.delta.write();
+            for ins in batch {
+                delta.insert(ins.id, ins.vector);
+            }
+        }
         Ok(())
     }
 
-    // Insert with metadata pairs indexed in FilterIndex for filtered search.
     pub fn insert_with_metadata(
         &self,
         vector: Vec<f32>,
@@ -124,10 +156,11 @@ impl VivyIndex {
     ) -> Result<u64, WalError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(ref wal_mutex) = self.wal {
-            let mut wal = wal_mutex.lock();
-            wal.append(&WalEntry::Insert { id, vector: vector.clone() })?;
-            wal.commit()?;
+        if let Some(ref sender) = self.wal_sender {
+            let _ = sender.try_send(WalEntry::Insert {
+                id,
+                vector: vector.clone(),
+            });
         }
 
         {
@@ -137,12 +170,54 @@ impl VivyIndex {
             }
         }
 
-        self.delta.write().insert(id, vector);
+        let mut pending = self.pending.lock();
+        pending.push(PendingInsert { id, vector });
+        if pending.len() >= 64 {
+            let batch = std::mem::take(&mut *pending);
+            drop(pending);
+            let mut delta = self.delta.write();
+            for ins in batch {
+                delta.insert(ins.id, ins.vector);
+            }
+        }
         Ok(id)
     }
 
-    // Search with optional filter. Delta uses predicate-pushed HNSW search;
-    // sealed segments use post-filtering (linear scan + bitmap check).
+    pub fn insert_batch(&self, vectors: Vec<Vec<f32>>) -> Vec<u64> {
+        let ids: Vec<u64> = (0..vectors.len())
+            .map(|_| self.next_id.fetch_add(1, Ordering::SeqCst))
+            .collect();
+
+        if let Some(ref sender) = self.wal_sender {
+            for (id, vec) in ids.iter().zip(vectors.iter()) {
+                let _ = sender.try_send(WalEntry::Insert {
+                    id: *id,
+                    vector: vec.clone(),
+                });
+            }
+        }
+
+        let mut delta = self.delta.write();
+        for (id, vec) in ids.iter().zip(vectors) {
+            delta.insert(*id, vec);
+        }
+        ids
+    }
+
+    fn flush_pending(&self) {
+        let batch = {
+            let mut p = self.pending.lock();
+            if p.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *p)
+        };
+        let mut guard = self.delta.write();
+        for ins in batch {
+            guard.insert(ins.id, ins.vector);
+        }
+    }
+
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -163,25 +238,33 @@ impl VivyIndex {
             return Vec::new();
         }
 
-        let metric = self.delta.read().metric();
-        let mut results: Vec<(u64, f32)>;
+        self.flush_pending();
 
-        // Delta segment: predicate-pushed HNSW search with dynamic ef expansion.
+        let metric;
+        let mut results: Vec<(u64, f32)>;
         {
             let guard = self.delta.read();
-            results = guard.search_filtered(query, k, filter_bitmap.as_ref());
+            metric = guard.metric();
+            let snapshot = guard.snapshot();
+            results = snapshot
+                .into_iter()
+                .filter(|(id, _)| {
+                    filter_bitmap
+                        .as_ref()
+                        .map_or(true, |bm| bm.contains(*id as u32))
+                })
+                .map(|(id, vec)| (id, distance::compute(metric, query, &vec)))
+                .collect();
         }
 
-        // Sealed segments: linear scan with optional post-filtering.
-        // ponytail: PQ-based ADC pre-filter to avoid full scan.
         let sealed_list = self.sealed.load();
         for seg in sealed_list.iter() {
             for idx in 0..seg.num_nodes() {
                 if let Ok(rec) = seg.read_node(idx) {
-                    let passes_filter = filter_bitmap
+                    let passes = filter_bitmap
                         .as_ref()
-                        .is_none_or(|bm| bm.contains(rec.id as u32));
-                    if !passes_filter {
+                        .map_or(true, |bm| bm.contains(rec.id as u32));
+                    if !passes {
                         continue;
                     }
                     if let Some(ref v) = rec.vector {
@@ -197,14 +280,19 @@ impl VivyIndex {
         results
     }
 
-    // Unfiltered search convenience wrapper.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let metric = self.delta.read().metric();
-        let mut results: Vec<(u64, f32)>;
+        self.flush_pending();
 
+        let metric;
+        let mut results: Vec<(u64, f32)>;
         {
             let guard = self.delta.read();
-            results = guard.search(query, k);
+            metric = guard.metric();
+            let snapshot = guard.snapshot();
+            results = snapshot
+                .into_iter()
+                .map(|(id, vec)| (id, distance::compute(metric, query, &vec)))
+                .collect();
         }
 
         let sealed_list = self.sealed.load();
@@ -224,19 +312,18 @@ impl VivyIndex {
         results
     }
 
-    // Vectors in the delta segment (excludes sealed).
     pub fn delta_len(&self) -> usize {
-        self.delta.read().len()
+        let pending = self.pending.lock().len();
+        pending + self.delta.read().len()
     }
 
-    // Sealed segment count.
     pub fn num_sealed(&self) -> usize {
         self.sealed.load().len()
     }
 
-    // Force immediate compaction. Auto-compaction triggers at 10K vectors.
     pub fn compact_now(&self) {
         if let Some(ref dir) = self.data_dir {
+            self.flush_pending();
             let m = self.delta.read().metric();
             if let Err(e) = run_compaction(&self.delta, &self.sealed, dir, m) {
                 warn!("compaction failed: {e}");
@@ -245,22 +332,35 @@ impl VivyIndex {
     }
 }
 
-// Signal compactor to exit on drop. Prevents resource leak from a dangling thread.
 impl Drop for VivyIndex {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        drop(self.wal_sender.take());
+        if let Some(h) = self.wal_handle.take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-// Polls every 5s, compacts when delta exceeds 10K vectors.
-// Conservative defaults. Tune for high insert rates.
-// ponytail: event-driven trigger (on insert threshold crossing) instead of polling.
+fn wal_worker_loop(rx: crossbeam_channel::Receiver<WalEntry>, mut writer: WalWriter) {
+    while let Ok(entry) = rx.recv() {
+        if let Err(e) = writer.append(&entry) {
+            warn!("WAL append failed: {e}");
+            continue;
+        }
+        if let Err(e) = writer.commit() {
+            warn!("WAL fsync failed: {e}");
+        }
+    }
+}
+
 fn compactor_loop(
     running: Arc<AtomicBool>,
     delta: Arc<RwLock<HnswIndex>>,
+    pending: Arc<Mutex<Vec<PendingInsert>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     data_dir: Option<PathBuf>,
     metric: Metric,
@@ -268,6 +368,19 @@ fn compactor_loop(
     let threshold = 10_000usize;
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(5));
+        let batch = {
+            let mut p = pending.lock();
+            if p.is_empty() {
+                continue;
+            }
+            std::mem::take(&mut *p)
+        };
+        {
+            let mut guard = delta.write();
+            for ins in batch {
+                guard.insert(ins.id, ins.vector);
+            }
+        }
         if delta.read().len() >= threshold {
             if let Some(ref dir) = data_dir {
                 if let Err(e) = run_compaction(&delta, &sealed, dir, metric) {
@@ -278,7 +391,6 @@ fn compactor_loop(
     }
 }
 
-// Atomically swap delta → sealed: drain delta, write to file, mmap, push to sealed list via arc-swap rcu.
 fn run_compaction(
     delta: &RwLock<HnswIndex>,
     sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
@@ -304,10 +416,6 @@ fn run_compaction(
     let writer = BufWriter::new(file.try_clone()?);
 
     let mut seg_writer = SegmentWriter::new(writer, dims, 16, 32);
-    // level=0 + empty neighbours because sealed segments don't share a graph
-    // with delta. No cross-segment edges — avoids global-lock problem.
-    // Cost: linear scan instead of HNSW search. Acceptable for <=100K vectors.
-    // ponytail: multi-segment merge with cross-segment edges for larger segments.
     for (id, vector) in &entries {
         seg_writer.push(*id, 0, vec![Vec::new()], vector.clone());
     }
@@ -315,22 +423,26 @@ fn run_compaction(
     drop(file);
 
     let new_seg = Arc::new(SealedSegment::open(&seg_path)?);
-
-    // rcu = read-copy-update: atomically swap Arc<Vec> — readers before see old list, after see new.
     sealed.rcu(|list| {
         let mut new_list = (**list).clone();
         new_list.push(new_seg.clone());
         new_list
     });
 
-    info!("sealed segment written: {} nodes at {:?}", entries.len(), seg_path);
+    info!(
+        "sealed segment written: {} nodes at {:?}",
+        entries.len(),
+        seg_path
+    );
     Ok(())
 }
 
-// Nanosecond timestamp for unique segment filenames. Collisions exceedingly unlikely.
 fn timestamp_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 #[cfg(test)]
@@ -338,7 +450,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    // Insert two, search for one, verify closest match.
     #[test]
     fn test_basic_insert_search() {
         let dir = tempdir().unwrap();
@@ -355,7 +466,6 @@ mod tests {
         drop(idx);
     }
 
-    // Insert 5, compact, verify delta empty + sealed exists + search works end-to-end.
     #[test]
     fn test_compaction() {
         let dir = tempdir().unwrap();
