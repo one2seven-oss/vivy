@@ -1,6 +1,7 @@
-<img src="assets/vivy.png" alt="Vivy" width="200">
+<p align="center">
+  <img src="assets/vivy.png" alt="Vivy">
+</p>
 
-[![CI](https://github.com/anomalyco/vivy/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/vivy/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
 [![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
@@ -77,7 +78,8 @@ Search latency is measured in microseconds, not milliseconds.
   computation.
 - **Compactor**: Background thread that flushes the pending buffer, freezes
   the delta on overflow, writes a sealed segment, and atomically swaps it
-  into the search path via `arc_swap`. Polls every 5 seconds.
+  into the search path via `arc_swap`. Event-driven — instant wake-up when
+  the delta exceeds threshold, with a 30-second safety timeout.
 - **Filter index**: Roaring bitmap per (field, value) pair. Filters are
   applied as a post-filter on the delta snapshot and sealed segment scan.
 
@@ -122,4 +124,3 @@ cargo run --release --bin vivy-bench
 Reports recall@10 vs brute force, QPS, and mean latency on random 64-dim
 data. Run it unoptimised first — the gap between debug and release builds is
 substantial.
-

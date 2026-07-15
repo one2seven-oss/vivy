@@ -18,6 +18,7 @@
 //!    writes sealed segments to disk.
 
 use crate::distance::{self, Metric};
+use crate::event::{EventBus, VivyEvent};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
@@ -29,6 +30,7 @@ use parking_lot::{Mutex, RwLock};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -49,6 +51,9 @@ pub struct VivyIndex {
     handle: Option<thread::JoinHandle<()>>,
     next_id: AtomicU64,
     data_dir: Option<PathBuf>,
+    events: Option<EventBus>,
+    compact_sender: Option<mpsc::Sender<()>>,
+    compaction_threshold: usize,
 }
 
 impl VivyIndex {
@@ -59,7 +64,26 @@ impl VivyIndex {
     ) -> Result<Self, WalError> {
         let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
+        Self::new_impl(metric, wal, data_dir, None)
+    }
 
+    pub fn new_with_events(
+        metric: Metric,
+        wal_path: Option<impl AsRef<Path>>,
+        data_dir: Option<impl AsRef<Path>>,
+        events: EventBus,
+    ) -> Result<Self, WalError> {
+        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
+        let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
+        Self::new_impl(metric, wal, data_dir, Some(events))
+    }
+
+    fn new_impl(
+        metric: Metric,
+        wal: Option<WalWriter>,
+        data_dir: Option<PathBuf>,
+        events: Option<EventBus>,
+    ) -> Result<Self, WalError> {
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
             Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
@@ -74,6 +98,7 @@ impl VivyIndex {
             (None, None)
         };
 
+        let (compact_tx, compact_rx) = mpsc::channel();
         let pending = Arc::new(Mutex::new(Vec::new()));
 
         let mut idx = Self {
@@ -87,22 +112,33 @@ impl VivyIndex {
             handle: None,
             next_id: AtomicU64::new(1),
             data_dir,
+            events,
+            compact_sender: Some(compact_tx),
+            compaction_threshold: 10_000,
         };
 
         let running = idx.running.clone();
         let delta = idx.delta.clone();
-        let pending = pending;
         let sealed = idx.sealed.clone();
         let dir = idx.data_dir.clone();
         let m = metric;
+        let ev = idx.events.clone();
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m))
+            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m, ev, compact_rx))
             .expect("compactor thread");
         idx.handle = Some(h);
 
         Ok(idx)
+    }
+
+    fn maybe_trigger_compaction(&self) {
+        if self.delta.read().len() >= self.compaction_threshold {
+            if let Some(ref sender) = self.compact_sender {
+                let _ = sender.send(());
+            }
+        }
     }
 
     pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
@@ -124,6 +160,8 @@ impl VivyIndex {
             for ins in batch {
                 delta.insert(ins.id, ins.vector);
             }
+            drop(delta);
+            self.maybe_trigger_compaction();
         }
         Ok(id)
     }
@@ -145,6 +183,8 @@ impl VivyIndex {
             for ins in batch {
                 delta.insert(ins.id, ins.vector);
             }
+            drop(delta);
+            self.maybe_trigger_compaction();
         }
         Ok(())
     }
@@ -179,6 +219,8 @@ impl VivyIndex {
             for ins in batch {
                 delta.insert(ins.id, ins.vector);
             }
+            drop(delta);
+            self.maybe_trigger_compaction();
         }
         Ok(id)
     }
@@ -201,6 +243,8 @@ impl VivyIndex {
         for (id, vec) in ids.iter().zip(vectors) {
             delta.insert(*id, vec);
         }
+        drop(delta);
+        self.maybe_trigger_compaction();
         ids
     }
 
@@ -251,7 +295,7 @@ impl VivyIndex {
                 .filter(|(id, _)| {
                     filter_bitmap
                         .as_ref()
-                        .map_or(true, |bm| bm.contains(*id as u32))
+                        .is_none_or(|bm| bm.contains(*id as u32))
                 })
                 .map(|(id, vec)| (id, distance::compute(metric, query, &vec)))
                 .collect();
@@ -263,7 +307,7 @@ impl VivyIndex {
                 if let Ok(rec) = seg.read_node(idx) {
                     let passes = filter_bitmap
                         .as_ref()
-                        .map_or(true, |bm| bm.contains(rec.id as u32));
+                        .is_none_or(|bm| bm.contains(rec.id as u32));
                     if !passes {
                         continue;
                     }
@@ -336,6 +380,7 @@ impl Drop for VivyIndex {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         drop(self.wal_sender.take());
+        drop(self.compact_sender.take());
         if let Some(h) = self.wal_handle.take() {
             let _ = h.join();
         }
@@ -357,6 +402,7 @@ fn wal_worker_loop(rx: crossbeam_channel::Receiver<WalEntry>, mut writer: WalWri
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compactor_loop(
     running: Arc<AtomicBool>,
     delta: Arc<RwLock<HnswIndex>>,
@@ -364,27 +410,50 @@ fn compactor_loop(
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     data_dir: Option<PathBuf>,
     metric: Metric,
+    events: Option<EventBus>,
+    trigger_rx: mpsc::Receiver<()>,
 ) {
     let threshold = 10_000usize;
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_secs(5));
+        let _ = trigger_rx.recv_timeout(Duration::from_secs(30));
         let batch = {
             let mut p = pending.lock();
-            if p.is_empty() {
-                continue;
+            if !p.is_empty() {
+                Some(std::mem::take(&mut *p))
+            } else {
+                None
             }
-            std::mem::take(&mut *p)
         };
-        {
+        if let Some(batch) = batch {
             let mut guard = delta.write();
             for ins in batch {
                 guard.insert(ins.id, ins.vector);
             }
         }
         if delta.read().len() >= threshold {
+            if let Some(ref events) = events {
+                events.emit(VivyEvent::CompactionStarted {
+                    delta_size: delta.read().len(),
+                });
+            }
             if let Some(ref dir) = data_dir {
-                if let Err(e) = run_compaction(&delta, &sealed, dir, metric) {
-                    warn!("compaction failed: {e}");
+                match run_compaction(&delta, &sealed, dir, metric) {
+                    Ok(_) => {
+                        if let Some(ref events) = events {
+                            events.emit(VivyEvent::CompactionFinished {
+                                num_sealed: sealed.load().len(),
+                                segment_path: format!("{:?}", dir),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ref events) = events {
+                            events.emit(VivyEvent::CompactionFailed {
+                                error: e.to_string(),
+                            });
+                        }
+                        warn!("compaction failed: {e}");
+                    }
                 }
             }
         }

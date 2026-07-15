@@ -1,4 +1,5 @@
 pub mod concurrent;
+pub mod event;
 pub mod distance;
 pub mod filter;
 pub mod flat;
