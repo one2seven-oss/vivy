@@ -371,6 +371,7 @@ Rust API features not available from Python:
 
 | Feature | Rust Module |
 |---------|-------------|
+| Tokio async wrapper (`features = ["async"]`) | `vivy_core::async_index::AsyncVivyIndex` |
 | Flat (brute-force) index | `vivy_core::flat::FlatIndex` |
 | Product Quantization | `vivy_core::pq::ProductQuantizer` |
 | Filter expression AST (Or, Not, In) | `vivy_core::filter::FilterExpr` |

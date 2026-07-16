@@ -5,6 +5,10 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Core vector index engine for Vivy — single-machine, memory-honest vector search"
 
+[features]
+default = []
+async = ["tokio", "futures"]
+
 [dependencies]
 fastrand = "2"
 ordered-float = { version = "4", features = ["std"] }
@@ -18,6 +22,8 @@ rand = "0.9"
 arc-swap = "1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["sync", "rt", "time"], optional = true }
+futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

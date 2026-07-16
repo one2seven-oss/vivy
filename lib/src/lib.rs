@@ -1,5 +1,7 @@
 pub mod concurrent;
 pub mod event;
+#[cfg(feature = "async")]
+pub mod async_index;
 pub mod distance;
 pub mod filter;
 pub mod flat;
