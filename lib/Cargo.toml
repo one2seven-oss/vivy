@@ -8,6 +8,7 @@ description = "Core vector index engine for Vivy — single-machine, memory-hone
 [features]
 default = []
 async = ["tokio", "futures"]
+prometheus = ["dep:prometheus"]
 
 [dependencies]
 fastrand = "2"
@@ -22,6 +23,8 @@ rand = "0.9"
 arc-swap = "1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"], optional = true }
+prometheus = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time"], optional = true }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 

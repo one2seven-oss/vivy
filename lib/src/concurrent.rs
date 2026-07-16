@@ -21,6 +21,7 @@ use crate::distance::{self, Metric};
 use crate::event::{EventBus, VivyEvent};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
+use crate::metrics::VivyMetrics;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
 use crate::storage::wal::{WalEntry, WalError, WalWriter};
 use arc_swap::ArcSwap;
@@ -33,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct PendingInsert {
     id: u64,
@@ -54,6 +55,7 @@ pub struct VivyIndex {
     events: Option<EventBus>,
     compact_sender: Option<mpsc::Sender<()>>,
     compaction_threshold: usize,
+    pub metrics: Arc<VivyMetrics>,
 }
 
 impl VivyIndex {
@@ -84,14 +86,17 @@ impl VivyIndex {
         data_dir: Option<PathBuf>,
         events: Option<EventBus>,
     ) -> Result<Self, WalError> {
+        let metrics = Arc::new(VivyMetrics::default());
+
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
             Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
         let (wal_sender, wal_handle) = if let Some(writer) = wal {
             let (tx, rx) = crossbeam_channel::bounded(4096);
+            let wal_metrics = metrics.clone();
             let h = thread::Builder::new()
                 .name("vivy-wal".into())
-                .spawn(move || wal_worker_loop(rx, writer))
+                .spawn(move || wal_worker_loop(rx, writer, wal_metrics))
                 .expect("WAL worker thread");
             (Some(tx), Some(h))
         } else {
@@ -100,6 +105,7 @@ impl VivyIndex {
 
         let (compact_tx, compact_rx) = mpsc::channel();
         let pending = Arc::new(Mutex::new(Vec::new()));
+        let comp_metrics = metrics.clone();
 
         let mut idx = Self {
             delta: Arc::new(RwLock::new(HnswIndex::new(metric))),
@@ -115,6 +121,7 @@ impl VivyIndex {
             events,
             compact_sender: Some(compact_tx),
             compaction_threshold: 10_000,
+            metrics,
         };
 
         let running = idx.running.clone();
@@ -126,7 +133,7 @@ impl VivyIndex {
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m, ev, compact_rx))
+            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m, ev, comp_metrics, compact_rx))
             .expect("compactor thread");
         idx.handle = Some(h);
 
@@ -142,6 +149,7 @@ impl VivyIndex {
     }
 
     pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
+        let t0 = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         if let Some(ref sender) = self.wal_sender {
@@ -162,11 +170,18 @@ impl VivyIndex {
             }
             drop(delta);
             self.maybe_trigger_compaction();
+        } else {
+            drop(pending);
         }
+        self.metrics.record_insert(t0.elapsed());
+        self.metrics
+            .delta_size
+            .store(self.delta_len(), Ordering::Relaxed);
         Ok(id)
     }
 
     pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), WalError> {
+        let t0 = Instant::now();
         if let Some(ref sender) = self.wal_sender {
             let _ = sender.try_send(WalEntry::Insert {
                 id,
@@ -185,7 +200,13 @@ impl VivyIndex {
             }
             drop(delta);
             self.maybe_trigger_compaction();
+        } else {
+            drop(pending);
         }
+        self.metrics.record_insert(t0.elapsed());
+        self.metrics
+            .delta_size
+            .store(self.delta_len(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -194,6 +215,7 @@ impl VivyIndex {
         vector: Vec<f32>,
         metadata: Vec<(String, String)>,
     ) -> Result<u64, WalError> {
+        let t0 = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         if let Some(ref sender) = self.wal_sender {
@@ -221,11 +243,18 @@ impl VivyIndex {
             }
             drop(delta);
             self.maybe_trigger_compaction();
+        } else {
+            drop(pending);
         }
+        self.metrics.record_insert(t0.elapsed());
+        self.metrics
+            .delta_size
+            .store(self.delta_len(), Ordering::Relaxed);
         Ok(id)
     }
 
     pub fn insert_batch(&self, vectors: Vec<Vec<f32>>) -> Vec<u64> {
+        let t0 = Instant::now();
         let ids: Vec<u64> = (0..vectors.len())
             .map(|_| self.next_id.fetch_add(1, Ordering::SeqCst))
             .collect();
@@ -245,6 +274,10 @@ impl VivyIndex {
         }
         drop(delta);
         self.maybe_trigger_compaction();
+        self.metrics.record_insert(t0.elapsed());
+        self.metrics
+            .delta_size
+            .store(self.delta_len(), Ordering::Relaxed);
         ids
     }
 
@@ -268,6 +301,7 @@ impl VivyIndex {
         k: usize,
         filter: Option<&FilterExpr>,
     ) -> Vec<(u64, f32)> {
+        let t0 = Instant::now();
         let (filter_bitmap, has_filter) = match filter {
             Some(expr) => {
                 let fi = self.filter_index.read();
@@ -279,6 +313,7 @@ impl VivyIndex {
         };
 
         if has_filter && filter_bitmap.is_none() {
+            self.metrics.record_search(t0.elapsed());
             return Vec::new();
         }
 
@@ -321,10 +356,12 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
+        self.metrics.record_search(t0.elapsed());
         results
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let t0 = Instant::now();
         self.flush_pending();
 
         let metric;
@@ -353,6 +390,7 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
+        self.metrics.record_search(t0.elapsed());
         results
     }
 
@@ -369,9 +407,15 @@ impl VivyIndex {
         if let Some(ref dir) = self.data_dir {
             self.flush_pending();
             let m = self.delta.read().metric();
+            let t0 = Instant::now();
             if let Err(e) = run_compaction(&self.delta, &self.sealed, dir, m) {
                 warn!("compaction failed: {e}");
             }
+            self.metrics.record_compaction(t0.elapsed());
+            self.metrics.num_sealed_segments.store(
+                self.sealed.load().len(),
+                Ordering::Relaxed,
+            );
         }
     }
 }
@@ -390,7 +434,11 @@ impl Drop for VivyIndex {
     }
 }
 
-fn wal_worker_loop(rx: crossbeam_channel::Receiver<WalEntry>, mut writer: WalWriter) {
+fn wal_worker_loop(
+    rx: crossbeam_channel::Receiver<WalEntry>,
+    mut writer: WalWriter,
+    metrics: Arc<VivyMetrics>,
+) {
     while let Ok(entry) = rx.recv() {
         if let Err(e) = writer.append(&entry) {
             warn!("WAL append failed: {e}");
@@ -399,6 +447,7 @@ fn wal_worker_loop(rx: crossbeam_channel::Receiver<WalEntry>, mut writer: WalWri
         if let Err(e) = writer.commit() {
             warn!("WAL fsync failed: {e}");
         }
+        metrics.wal_fsyncs_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -411,6 +460,7 @@ fn compactor_loop(
     data_dir: Option<PathBuf>,
     metric: Metric,
     events: Option<EventBus>,
+    metrics: Arc<VivyMetrics>,
     trigger_rx: mpsc::Receiver<()>,
 ) {
     let threshold = 10_000usize;
@@ -437,8 +487,14 @@ fn compactor_loop(
                 });
             }
             if let Some(ref dir) = data_dir {
+                let t0 = Instant::now();
                 match run_compaction(&delta, &sealed, dir, metric) {
                     Ok(_) => {
+                        metrics.record_compaction(t0.elapsed());
+                        metrics.num_sealed_segments.store(
+                            sealed.load().len(),
+                            Ordering::Relaxed,
+                        );
                         if let Some(ref events) = events {
                             events.emit(VivyEvent::CompactionFinished {
                                 num_sealed: sealed.load().len(),

@@ -6,5 +6,6 @@ pub mod distance;
 pub mod filter;
 pub mod flat;
 pub mod hnsw;
+pub mod metrics;
 pub mod pq;
 pub mod storage;

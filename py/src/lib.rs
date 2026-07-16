@@ -71,6 +71,19 @@ impl Index {
     fn __len__(&self) -> usize {
         self.inner.delta_len()
     }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let snap = self.inner.metrics.snapshot();
+        let d = PyDict::new(py);
+        d.set_item("inserts_total", snap.inserts_total)?;
+        d.set_item("searches_total", snap.searches_total)?;
+        d.set_item("compactions_total", snap.compactions_total)?;
+        d.set_item("avg_insert_time_ns", snap.avg_insert_time_ns)?;
+        d.set_item("avg_search_time_ns", snap.avg_search_time_ns)?;
+        d.set_item("delta_size", snap.delta_size)?;
+        d.set_item("num_sealed", snap.num_sealed)?;
+        Ok(d.into())
+    }
 }
 
 // Python dict → Vec<(String, String)>. All values coerced to string. None/empty = no-op.
