@@ -1,4 +1,5 @@
 pub mod concurrent;
+pub mod error;
 pub mod event;
 #[cfg(feature = "async")]
 pub mod async_index;

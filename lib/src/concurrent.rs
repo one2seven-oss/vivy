@@ -18,12 +18,13 @@
 //!    writes sealed segments to disk.
 
 use crate::distance::{self, Metric};
+use crate::error::{VivyError, VivyResult};
 use crate::event::{EventBus, VivyEvent};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
 use crate::metrics::VivyMetrics;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
-use crate::storage::wal::{WalEntry, WalError, WalWriter};
+use crate::storage::wal::{WalEntry, WalWriter};
 use arc_swap::ArcSwap;
 use crossbeam_channel;
 use log::{info, warn};
@@ -55,6 +56,7 @@ pub struct VivyIndex {
     events: Option<EventBus>,
     compact_sender: Option<mpsc::Sender<()>>,
     compaction_threshold: usize,
+    max_vectors: Option<usize>,
     pub metrics: Arc<VivyMetrics>,
 }
 
@@ -63,7 +65,7 @@ impl VivyIndex {
         metric: Metric,
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
-    ) -> Result<Self, WalError> {
+    ) -> VivyResult<Self> {
         let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
         Self::new_impl(metric, wal, data_dir, None)
@@ -74,7 +76,7 @@ impl VivyIndex {
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
         events: EventBus,
-    ) -> Result<Self, WalError> {
+    ) -> VivyResult<Self> {
         let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
         Self::new_impl(metric, wal, data_dir, Some(events))
@@ -85,7 +87,7 @@ impl VivyIndex {
         wal: Option<WalWriter>,
         data_dir: Option<PathBuf>,
         events: Option<EventBus>,
-    ) -> Result<Self, WalError> {
+    ) -> VivyResult<Self> {
         let metrics = Arc::new(VivyMetrics::default());
 
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
@@ -121,6 +123,7 @@ impl VivyIndex {
             events,
             compact_sender: Some(compact_tx),
             compaction_threshold: 10_000,
+            max_vectors: None,
             metrics,
         };
 
@@ -148,7 +151,12 @@ impl VivyIndex {
         }
     }
 
-    pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
+    pub fn insert(&self, vector: Vec<f32>) -> VivyResult<u64> {
+        if let Some(cap) = self.max_vectors {
+            if self.total_vectors() >= cap {
+                return Err(VivyError::IndexFull { capacity: cap });
+            }
+        }
         let t0 = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -180,7 +188,7 @@ impl VivyIndex {
         Ok(id)
     }
 
-    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), WalError> {
+    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> VivyResult<()> {
         let t0 = Instant::now();
         if let Some(ref sender) = self.wal_sender {
             let _ = sender.try_send(WalEntry::Insert {
@@ -214,7 +222,12 @@ impl VivyIndex {
         &self,
         vector: Vec<f32>,
         metadata: Vec<(String, String)>,
-    ) -> Result<u64, WalError> {
+    ) -> VivyResult<u64> {
+        if let Some(cap) = self.max_vectors {
+            if self.total_vectors() >= cap {
+                return Err(VivyError::IndexFull { capacity: cap });
+            }
+        }
         let t0 = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -403,6 +416,15 @@ impl VivyIndex {
         self.sealed.load().len()
     }
 
+    pub fn total_vectors(&self) -> usize {
+        self.delta_len() + self.sealed.load().iter().map(|s| s.num_nodes()).sum::<usize>()
+    }
+
+    pub fn with_capacity(mut self, max_vectors: usize) -> Self {
+        self.max_vectors = Some(max_vectors);
+        self
+    }
+
     pub fn compact_now(&self) {
         if let Some(ref dir) = self.data_dir {
             self.flush_pending();
@@ -417,6 +439,36 @@ impl VivyIndex {
                 Ordering::Relaxed,
             );
         }
+    }
+
+    pub fn recover(
+        metric: Metric,
+        wal_path: PathBuf,
+        data_dir: PathBuf,
+    ) -> VivyResult<Self> {
+        let idx = Self::new(metric, Some(&wal_path), Some(&data_dir))?;
+
+        WalWriter::replay(&wal_path, |entry| {
+            if let WalEntry::Insert { id, vector } = entry {
+                idx.delta.write().insert(id, vector);
+            }
+        })?;
+
+        if data_dir.exists() {
+            for entry in std::fs::read_dir(&data_dir)? {
+                let path = entry?.path();
+                if path.extension().map_or(false, |ext| ext == "vivy") {
+                    let seg = Arc::new(SealedSegment::open(&path)?);
+                    idx.sealed.rcu(|list| {
+                        let mut new_list = (**list).clone();
+                        new_list.push(seg.clone());
+                        new_list
+                    });
+                }
+            }
+        }
+
+        Ok(idx)
     }
 }
 
@@ -488,8 +540,8 @@ fn compactor_loop(
             }
             if let Some(ref dir) = data_dir {
                 let t0 = Instant::now();
-                match run_compaction(&delta, &sealed, dir, metric) {
-                    Ok(_) => {
+                match run_compaction_with_retry(&delta, &sealed, dir, metric, 3) {
+                    Ok(()) => {
                         metrics.record_compaction(t0.elapsed());
                         metrics.num_sealed_segments.store(
                             sealed.load().len(),
@@ -508,7 +560,7 @@ fn compactor_loop(
                                 error: e.to_string(),
                             });
                         }
-                        warn!("compaction failed: {e}");
+                        warn!("compaction failed after retries: {e}");
                     }
                 }
             }
@@ -521,7 +573,7 @@ fn run_compaction(
     sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
     data_dir: &Path,
     metric: Metric,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> VivyResult<()> {
     let mut old = {
         let mut guard = delta.write();
         let fresh = HnswIndex::new(metric);
@@ -560,6 +612,31 @@ fn run_compaction(
         seg_path
     );
     Ok(())
+}
+
+fn run_compaction_with_retry(
+    delta: &RwLock<HnswIndex>,
+    sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
+    data_dir: &Path,
+    metric: Metric,
+    max_retries: u32,
+) -> VivyResult<()> {
+    let mut retries = 0;
+    loop {
+        match run_compaction(delta, sealed, data_dir, metric) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                retries += 1;
+                if retries >= max_retries {
+                    return Err(VivyError::Compaction(format!(
+                        "failed after {retries} retries: {e}"
+                    )));
+                }
+                warn!("compaction attempt {retries} failed: {e}, retrying...");
+                std::thread::sleep(Duration::from_millis(100 * 2u64.pow(retries)));
+            }
+        }
+    }
 }
 
 fn timestamp_ns() -> u64 {

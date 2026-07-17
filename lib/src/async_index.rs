@@ -6,8 +6,8 @@ use tokio::sync::Notify;
 
 use crate::concurrent::VivyIndex;
 use crate::distance::Metric;
+use crate::error::VivyResult;
 use crate::event::{EventBus, VivyEvent};
-use crate::storage::wal::WalError;
 
 pub struct AsyncVivyIndex {
     inner: Arc<VivyIndex>,
@@ -20,7 +20,7 @@ impl AsyncVivyIndex {
         metric: Metric,
         wal: Option<PathBuf>,
         data: Option<PathBuf>,
-    ) -> Result<Self, WalError> {
+    ) -> VivyResult<Self> {
         let (bus, sub) = EventBus::new();
         let inner = Arc::new(VivyIndex::new_with_events(metric, wal, data, bus)?);
 
@@ -46,7 +46,7 @@ impl AsyncVivyIndex {
         Ok(Self { inner, insert_notify, compact_notify })
     }
 
-    pub async fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
+    pub async fn insert(&self, vector: Vec<f32>) -> VivyResult<u64> {
         let inner = self.inner.clone();
         let id = tokio::task::spawn_blocking(move || inner.insert(vector))
             .await
