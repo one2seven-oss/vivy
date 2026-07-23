@@ -1,16 +1,12 @@
-// ponytail: Benchmark harness — recall@10 vs flat, QPS, latency.
-// Upgrade: add SIFT1M/GIST1M loaders, VectorDBBench integration.
-
+use rand::Rng;
+use std::time::Instant;
+use tempfile::tempdir;
 use vivy_core::concurrent::VivyIndex;
 use vivy_core::distance::Metric;
 use vivy_core::flat::FlatIndex;
-use std::time::Instant;
-use rand::Rng;
-use tempfile::tempdir;
 
 fn main() {
     println!("Vivy benchmark");
-    println!("==============");
 
     let dims = 64;
     let n = 5000;
@@ -19,7 +15,7 @@ fn main() {
 
     let (data, queries) = generate_data(dims, n, n_queries);
 
-    // Build brute-force index for ground truth
+    // brute-force index
     println!("\nBuilding brute-force index ({} vectors)...", n);
     let start = Instant::now();
     let mut flat = FlatIndex::new(Metric::L2);
@@ -33,9 +29,7 @@ fn main() {
     println!("Computing ground truth...");
     let gt: Vec<Vec<u64>> = queries
         .iter()
-        .map(|q| {
-            flat.search(q, k).into_iter().map(|(id, _)| id).collect()
-        })
+        .map(|q| flat.search(q, k).into_iter().map(|(id, _)| id).collect())
         .collect();
     drop(flat);
 
@@ -48,7 +42,11 @@ fn main() {
         idx.insert(v.clone()).unwrap();
     }
     let index_time = start.elapsed();
-    println!("  hnsw build: {:?} ({} vec/s)", index_time, n as f64 / index_time.as_secs_f64());
+    println!(
+        "  hnsw build: {:?} ({} vec/s)",
+        index_time,
+        n as f64 / index_time.as_secs_f64()
+    );
 
     // Warmup
     for q in &queries[..10] {
@@ -76,7 +74,10 @@ fn main() {
     println!("  recall@{}: {:.4}", k, recall);
     println!("  total time: {:?}", elapsed);
     println!("  QPS: {:.1}", qps);
-    println!("  p50 latency: {:.2}ms", (elapsed.as_secs_f64() / n_queries as f64) * 1000.0);
+    println!(
+        "  p50 latency: {:.2}ms",
+        (elapsed.as_secs_f64() / n_queries as f64) * 1000.0
+    );
 }
 
 fn generate_data(dims: usize, n: usize, nq: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {

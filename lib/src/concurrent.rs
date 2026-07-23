@@ -1,63 +1,28 @@
-//! Segment-based concurrency model with non-blocking inserts.
-//!
-//! Thread-safe VivyIndex combinin four ideas for concurrent reads during writes:
-//!
-//! 1. **Delta/Pending split** — new vectors go into a small pending buffer,
-//!    flushed in batches to the delta (RwLock). When delta exceeds a threshold,
-//!    it's serialised to an immutable sealed segment and atomically swapped
-//!    into the read path via arc-swap.
-//!
-//! 2. **Read-side snapshot** — every search copies delta entries under a brief
-//!    read lock, releases it, then searches the snapshot + sealed segments.
-//!    No lock held during distance computation.
-//!
-//! 3. **Background WAL worker** — WAL append+fsync runs in a dedicated thread
-//!    via a bounded channel, decoupled from the insert path.
-//!
-//! 4. **Background compactor** — monitors delta size, triggers compaction,
-//!    writes sealed segments to disk.
-
 use crate::distance::{self, Metric};
-use crate::error::{VivyError, VivyResult};
-use crate::event::{EventBus, VivyEvent};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
-use crate::metrics::VivyMetrics;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
-use crate::storage::wal::{WalEntry, WalWriter};
+use crate::storage::wal::{WalEntry, WalError, WalWriter};
 use arc_swap::ArcSwap;
-use crossbeam_channel;
 use log::{info, warn};
 use parking_lot::{Mutex, RwLock};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-struct PendingInsert {
-    id: u64,
-    vector: Vec<f32>,
-}
-
+/// Thread-safe vector index (mutable delta segment + atomically-swappable sealed list)
 pub struct VivyIndex {
-    delta: Arc<RwLock<HnswIndex>>,
+    pub(crate) delta: Arc<RwLock<HnswIndex>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
-    filter_index: RwLock<FilterIndex>,
-    wal_sender: Option<crossbeam_channel::Sender<WalEntry>>,
-    wal_handle: Option<thread::JoinHandle<()>>,
-    pending: Arc<Mutex<Vec<PendingInsert>>>,
+    pub(crate) filter_index: RwLock<FilterIndex>,
+    wal: Option<Mutex<WalWriter>>,
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
-    next_id: AtomicU64,
+    pub(crate) next_id: AtomicU64,
     data_dir: Option<PathBuf>,
-    events: Option<EventBus>,
-    compact_sender: Option<mpsc::Sender<()>>,
-    compaction_threshold: usize,
-    max_vectors: Option<usize>,
-    pub metrics: Arc<VivyMetrics>,
 }
 
 impl VivyIndex {
@@ -65,66 +30,26 @@ impl VivyIndex {
         metric: Metric,
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
-    ) -> VivyResult<Self> {
-        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
+    ) -> Result<Self, WalError> {
+        let wal = wal_path
+            .as_ref()
+            .map(WalWriter::open)
+            .transpose()?
+            .map(Mutex::new);
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
-        Self::new_impl(metric, wal, data_dir, None)
-    }
-
-    pub fn new_with_events(
-        metric: Metric,
-        wal_path: Option<impl AsRef<Path>>,
-        data_dir: Option<impl AsRef<Path>>,
-        events: EventBus,
-    ) -> VivyResult<Self> {
-        let wal = wal_path.as_ref().map(WalWriter::open).transpose()?;
-        let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
-        Self::new_impl(metric, wal, data_dir, Some(events))
-    }
-
-    fn new_impl(
-        metric: Metric,
-        wal: Option<WalWriter>,
-        data_dir: Option<PathBuf>,
-        events: Option<EventBus>,
-    ) -> VivyResult<Self> {
-        let metrics = Arc::new(VivyMetrics::default());
 
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
             Arc::new(ArcSwap::new(Arc::new(Vec::new())));
-
-        let (wal_sender, wal_handle) = if let Some(writer) = wal {
-            let (tx, rx) = crossbeam_channel::bounded(4096);
-            let wal_metrics = metrics.clone();
-            let h = thread::Builder::new()
-                .name("vivy-wal".into())
-                .spawn(move || wal_worker_loop(rx, writer, wal_metrics))
-                .expect("WAL worker thread");
-            (Some(tx), Some(h))
-        } else {
-            (None, None)
-        };
-
-        let (compact_tx, compact_rx) = mpsc::channel();
-        let pending = Arc::new(Mutex::new(Vec::new()));
-        let comp_metrics = metrics.clone();
 
         let mut idx = Self {
             delta: Arc::new(RwLock::new(HnswIndex::new(metric))),
             sealed: sealed.clone(),
             filter_index: RwLock::new(FilterIndex::new()),
-            wal_sender,
-            wal_handle,
-            pending: pending.clone(),
+            wal,
             running: Arc::new(AtomicBool::new(true)),
             handle: None,
             next_id: AtomicU64::new(1),
             data_dir,
-            events,
-            compact_sender: Some(compact_tx),
-            compaction_threshold: 10_000,
-            max_vectors: None,
-            metrics,
         };
 
         let running = idx.running.clone();
@@ -132,110 +57,62 @@ impl VivyIndex {
         let sealed = idx.sealed.clone();
         let dir = idx.data_dir.clone();
         let m = metric;
-        let ev = idx.events.clone();
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, delta, pending, sealed, dir, m, ev, comp_metrics, compact_rx))
+            .spawn(move || compactor_loop(running, delta, sealed, dir, m))
             .expect("compactor thread");
         idx.handle = Some(h);
 
         Ok(idx)
     }
 
-    fn maybe_trigger_compaction(&self) {
-        if self.delta.read().len() >= self.compaction_threshold {
-            if let Some(ref sender) = self.compact_sender {
-                let _ = sender.send(());
-            }
-        }
-    }
-
-    pub fn insert(&self, vector: Vec<f32>) -> VivyResult<u64> {
-        if let Some(cap) = self.max_vectors {
-            if self.total_vectors() >= cap {
-                return Err(VivyError::IndexFull { capacity: cap });
-            }
-        }
-        let t0 = Instant::now();
+    /// Insert with auto-generated ID
+    pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(ref sender) = self.wal_sender {
-            let _ = sender.try_send(WalEntry::Insert {
+        if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            wal.append(&WalEntry::Insert {
                 id,
                 vector: vector.clone(),
-            });
+            })?;
+            wal.commit()?;
         }
 
-        let mut pending = self.pending.lock();
-        pending.push(PendingInsert { id, vector });
-        if pending.len() >= 64 {
-            let batch = std::mem::take(&mut *pending);
-            drop(pending);
-            let mut delta = self.delta.write();
-            for ins in batch {
-                delta.insert(ins.id, ins.vector);
-            }
-            drop(delta);
-            self.maybe_trigger_compaction();
-        } else {
-            drop(pending);
-        }
-        self.metrics.record_insert(t0.elapsed());
-        self.metrics
-            .delta_size
-            .store(self.delta_len(), Ordering::Relaxed);
+        self.delta.write().insert(id, vector);
         Ok(id)
     }
 
-    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> VivyResult<()> {
-        let t0 = Instant::now();
-        if let Some(ref sender) = self.wal_sender {
-            let _ = sender.try_send(WalEntry::Insert {
+    /// Insert with explicit ID
+    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), WalError> {
+        if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            wal.append(&WalEntry::Insert {
                 id,
                 vector: vector.clone(),
-            });
+            })?;
+            wal.commit()?;
         }
-
-        let mut pending = self.pending.lock();
-        pending.push(PendingInsert { id, vector });
-        if pending.len() >= 64 {
-            let batch = std::mem::take(&mut *pending);
-            drop(pending);
-            let mut delta = self.delta.write();
-            for ins in batch {
-                delta.insert(ins.id, ins.vector);
-            }
-            drop(delta);
-            self.maybe_trigger_compaction();
-        } else {
-            drop(pending);
-        }
-        self.metrics.record_insert(t0.elapsed());
-        self.metrics
-            .delta_size
-            .store(self.delta_len(), Ordering::Relaxed);
+        self.delta.write().insert(id, vector);
         Ok(())
     }
 
+    /// Insert with metadata fields for filtering
     pub fn insert_with_metadata(
         &self,
         vector: Vec<f32>,
         metadata: Vec<(String, String)>,
-    ) -> VivyResult<u64> {
-        if let Some(cap) = self.max_vectors {
-            if self.total_vectors() >= cap {
-                return Err(VivyError::IndexFull { capacity: cap });
-            }
-        }
-        let t0 = Instant::now();
+    ) -> Result<u64, WalError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(ref sender) = self.wal_sender {
-            let _ = sender.try_send(WalEntry::Insert {
+        if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            wal.append(&WalEntry::Insert {
                 id,
                 vector: vector.clone(),
-            });
+            })?;
+            wal.commit()?;
         }
 
         {
@@ -245,76 +122,17 @@ impl VivyIndex {
             }
         }
 
-        let mut pending = self.pending.lock();
-        pending.push(PendingInsert { id, vector });
-        if pending.len() >= 64 {
-            let batch = std::mem::take(&mut *pending);
-            drop(pending);
-            let mut delta = self.delta.write();
-            for ins in batch {
-                delta.insert(ins.id, ins.vector);
-            }
-            drop(delta);
-            self.maybe_trigger_compaction();
-        } else {
-            drop(pending);
-        }
-        self.metrics.record_insert(t0.elapsed());
-        self.metrics
-            .delta_size
-            .store(self.delta_len(), Ordering::Relaxed);
+        self.delta.write().insert(id, vector);
         Ok(id)
     }
 
-    pub fn insert_batch(&self, vectors: Vec<Vec<f32>>) -> Vec<u64> {
-        let t0 = Instant::now();
-        let ids: Vec<u64> = (0..vectors.len())
-            .map(|_| self.next_id.fetch_add(1, Ordering::SeqCst))
-            .collect();
-
-        if let Some(ref sender) = self.wal_sender {
-            for (id, vec) in ids.iter().zip(vectors.iter()) {
-                let _ = sender.try_send(WalEntry::Insert {
-                    id: *id,
-                    vector: vec.clone(),
-                });
-            }
-        }
-
-        let mut delta = self.delta.write();
-        for (id, vec) in ids.iter().zip(vectors) {
-            delta.insert(*id, vec);
-        }
-        drop(delta);
-        self.maybe_trigger_compaction();
-        self.metrics.record_insert(t0.elapsed());
-        self.metrics
-            .delta_size
-            .store(self.delta_len(), Ordering::Relaxed);
-        ids
-    }
-
-    fn flush_pending(&self) {
-        let batch = {
-            let mut p = self.pending.lock();
-            if p.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *p)
-        };
-        let mut guard = self.delta.write();
-        for ins in batch {
-            guard.insert(ins.id, ins.vector);
-        }
-    }
-
+    /// Search with an optional filter expression
     pub fn search_filtered(
         &self,
         query: &[f32],
         k: usize,
         filter: Option<&FilterExpr>,
     ) -> Vec<(u64, f32)> {
-        let t0 = Instant::now();
         let (filter_bitmap, has_filter) = match filter {
             Some(expr) => {
                 let fi = self.filter_index.read();
@@ -325,38 +143,29 @@ impl VivyIndex {
             None => (None, false),
         };
 
+        // If a filter was provided but no items match, return empty
         if has_filter && filter_bitmap.is_none() {
-            self.metrics.record_search(t0.elapsed());
             return Vec::new();
         }
 
-        self.flush_pending();
-
-        let metric;
+        let metric = self.delta.read().metric();
         let mut results: Vec<(u64, f32)>;
+
+        // Search delta
         {
             let guard = self.delta.read();
-            metric = guard.metric();
-            let snapshot = guard.snapshot();
-            results = snapshot
-                .into_iter()
-                .filter(|(id, _)| {
-                    filter_bitmap
-                        .as_ref()
-                        .is_none_or(|bm| bm.contains(*id as u32))
-                })
-                .map(|(id, vec)| (id, distance::compute(metric, query, &vec)))
-                .collect();
+            results = guard.search_filtered(query, k, filter_bitmap.as_ref());
         }
 
+        // Search sealed segments
         let sealed_list = self.sealed.load();
         for seg in sealed_list.iter() {
             for idx in 0..seg.num_nodes() {
                 if let Ok(rec) = seg.read_node(idx) {
-                    let passes = filter_bitmap
+                    let passes_filter = filter_bitmap
                         .as_ref()
                         .is_none_or(|bm| bm.contains(rec.id as u32));
-                    if !passes {
+                    if !passes_filter {
                         continue;
                     }
                     if let Some(ref v) = rec.vector {
@@ -369,24 +178,17 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
-        self.metrics.record_search(t0.elapsed());
         results
     }
 
+    /// Search across delta + all sealed segments.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let t0 = Instant::now();
-        self.flush_pending();
-
-        let metric;
+        let metric = self.delta.read().metric();
         let mut results: Vec<(u64, f32)>;
+
         {
             let guard = self.delta.read();
-            metric = guard.metric();
-            let snapshot = guard.snapshot();
-            results = snapshot
-                .into_iter()
-                .map(|(id, vec)| (id, distance::compute(metric, query, &vec)))
-                .collect();
+            results = guard.search(query, k);
         }
 
         let sealed_list = self.sealed.load();
@@ -403,165 +205,51 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
-        self.metrics.record_search(t0.elapsed());
         results
     }
 
     pub fn delta_len(&self) -> usize {
-        let pending = self.pending.lock().len();
-        pending + self.delta.read().len()
+        self.delta.read().len()
     }
 
     pub fn num_sealed(&self) -> usize {
         self.sealed.load().len()
     }
 
-    pub fn total_vectors(&self) -> usize {
-        self.delta_len() + self.sealed.load().iter().map(|s| s.num_nodes()).sum::<usize>()
-    }
-
-    pub fn with_capacity(mut self, max_vectors: usize) -> Self {
-        self.max_vectors = Some(max_vectors);
-        self
-    }
-
+    /// Force immediate compaction.
     pub fn compact_now(&self) {
         if let Some(ref dir) = self.data_dir {
-            self.flush_pending();
             let m = self.delta.read().metric();
-            let t0 = Instant::now();
             if let Err(e) = run_compaction(&self.delta, &self.sealed, dir, m) {
                 warn!("compaction failed: {e}");
             }
-            self.metrics.record_compaction(t0.elapsed());
-            self.metrics.num_sealed_segments.store(
-                self.sealed.load().len(),
-                Ordering::Relaxed,
-            );
         }
-    }
-
-    pub fn recover(
-        metric: Metric,
-        wal_path: PathBuf,
-        data_dir: PathBuf,
-    ) -> VivyResult<Self> {
-        let idx = Self::new(metric, Some(&wal_path), Some(&data_dir))?;
-
-        WalWriter::replay(&wal_path, |entry| {
-            if let WalEntry::Insert { id, vector } = entry {
-                idx.delta.write().insert(id, vector);
-            }
-        })?;
-
-        if data_dir.exists() {
-            for entry in std::fs::read_dir(&data_dir)? {
-                let path = entry?.path();
-                if path.extension().map_or(false, |ext| ext == "vivy") {
-                    let seg = Arc::new(SealedSegment::open(&path)?);
-                    idx.sealed.rcu(|list| {
-                        let mut new_list = (**list).clone();
-                        new_list.push(seg.clone());
-                        new_list
-                    });
-                }
-            }
-        }
-
-        Ok(idx)
     }
 }
 
 impl Drop for VivyIndex {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        drop(self.wal_sender.take());
-        drop(self.compact_sender.take());
-        if let Some(h) = self.wal_handle.take() {
-            let _ = h.join();
-        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-fn wal_worker_loop(
-    rx: crossbeam_channel::Receiver<WalEntry>,
-    mut writer: WalWriter,
-    metrics: Arc<VivyMetrics>,
-) {
-    while let Ok(entry) = rx.recv() {
-        if let Err(e) = writer.append(&entry) {
-            warn!("WAL append failed: {e}");
-            continue;
-        }
-        if let Err(e) = writer.commit() {
-            warn!("WAL fsync failed: {e}");
-        }
-        metrics.wal_fsyncs_total.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn compactor_loop(
     running: Arc<AtomicBool>,
     delta: Arc<RwLock<HnswIndex>>,
-    pending: Arc<Mutex<Vec<PendingInsert>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     data_dir: Option<PathBuf>,
     metric: Metric,
-    events: Option<EventBus>,
-    metrics: Arc<VivyMetrics>,
-    trigger_rx: mpsc::Receiver<()>,
 ) {
     let threshold = 10_000usize;
     while running.load(Ordering::SeqCst) {
-        let _ = trigger_rx.recv_timeout(Duration::from_secs(30));
-        let batch = {
-            let mut p = pending.lock();
-            if !p.is_empty() {
-                Some(std::mem::take(&mut *p))
-            } else {
-                None
-            }
-        };
-        if let Some(batch) = batch {
-            let mut guard = delta.write();
-            for ins in batch {
-                guard.insert(ins.id, ins.vector);
-            }
-        }
+        thread::sleep(Duration::from_secs(5));
         if delta.read().len() >= threshold {
-            if let Some(ref events) = events {
-                events.emit(VivyEvent::CompactionStarted {
-                    delta_size: delta.read().len(),
-                });
-            }
             if let Some(ref dir) = data_dir {
-                let t0 = Instant::now();
-                match run_compaction_with_retry(&delta, &sealed, dir, metric, 3) {
-                    Ok(()) => {
-                        metrics.record_compaction(t0.elapsed());
-                        metrics.num_sealed_segments.store(
-                            sealed.load().len(),
-                            Ordering::Relaxed,
-                        );
-                        if let Some(ref events) = events {
-                            events.emit(VivyEvent::CompactionFinished {
-                                num_sealed: sealed.load().len(),
-                                segment_path: format!("{:?}", dir),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref events) = events {
-                            events.emit(VivyEvent::CompactionFailed {
-                                error: e.to_string(),
-                            });
-                        }
-                        warn!("compaction failed after retries: {e}");
-                    }
+                if let Err(e) = run_compaction(&delta, &sealed, dir, metric) {
+                    warn!("compaction failed: {e}");
                 }
             }
         }
@@ -573,7 +261,7 @@ fn run_compaction(
     sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
     data_dir: &Path,
     metric: Metric,
-) -> VivyResult<()> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut old = {
         let mut guard = delta.write();
         let fresh = HnswIndex::new(metric);
@@ -600,6 +288,7 @@ fn run_compaction(
     drop(file);
 
     let new_seg = Arc::new(SealedSegment::open(&seg_path)?);
+
     sealed.rcu(|list| {
         let mut new_list = (**list).clone();
         new_list.push(new_seg.clone());
@@ -612,31 +301,6 @@ fn run_compaction(
         seg_path
     );
     Ok(())
-}
-
-fn run_compaction_with_retry(
-    delta: &RwLock<HnswIndex>,
-    sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
-    data_dir: &Path,
-    metric: Metric,
-    max_retries: u32,
-) -> VivyResult<()> {
-    let mut retries = 0;
-    loop {
-        match run_compaction(delta, sealed, data_dir, metric) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                retries += 1;
-                if retries >= max_retries {
-                    return Err(VivyError::Compaction(format!(
-                        "failed after {retries} retries: {e}"
-                    )));
-                }
-                warn!("compaction attempt {retries} failed: {e}, retrying...");
-                std::thread::sleep(Duration::from_millis(100 * 2u64.pow(retries)));
-            }
-        }
-    }
 }
 
 fn timestamp_ns() -> u64 {

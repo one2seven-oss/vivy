@@ -1,17 +1,3 @@
-//! Write-Ahead Log for crash safety.
-//!
-//! Every insert/delete goes to the log *before* the in-memory delta.
-//! Replay on restart restores the last committed state after a crash.
-//!
-//! Design:
-//! - **Append-only**: entries always at EOF, no seeks, no overwrites.
-//! - **BufWriter + sync_all**: buffered writes for throughput, fsync on commit.
-//! - **Tag-length-value**: 1-byte tag + fixed-size fields + variable payload.
-//!   Partial final entries (kill -9 mid-write) are detected during replay
-//!   by EOF on read_exact — data before the last successful write is intact.
-//! - **Flush checkpoint** (tag 0xFF): marks a point where the delta has been
-//!   sealed, so entries before it can be skipped on replay (WAL truncation).
-
 use log::warn;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -26,25 +12,21 @@ pub enum WalError {
     Corrupt(u64),
 }
 
-// WAL entry types. Insert carries the full vector for additive replay.
-// Delete carries only the ID. Flush is a checkpoint marker.
+///single recorded operation in the WAL.
 #[derive(Debug, Clone)]
 pub enum WalEntry {
     Insert { id: u64, vector: Vec<f32> },
-    Delete { id: u64 },
-    Flush,
 }
 
-// Append-only, crash-safe, single-writer WAL. Tracks committed byte offset for truncation.
+/// append-only, crash-safe.
 pub struct WalWriter {
     file: BufWriter<File>,
-    _path: Box<Path>,
+    #[allow(dead_code)]
+    path: Box<Path>,
     committed: u64,
 }
 
 impl WalWriter {
-    // Open/create in append+read mode. `committed` = current file length
-    // (bytes from a previous session are already durable).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref();
         let file = OpenOptions::new()
@@ -55,35 +37,22 @@ impl WalWriter {
         let committed = file.metadata()?.len();
         Ok(Self {
             file: BufWriter::new(file),
-            _path: path.into(),
+            path: path.into(),
             committed,
         })
     }
 
-    // Buffered write. Not durable until commit().
-    // Encoding: Insert=0x01|id(8)|dim(4)|vector(dim*4), Delete=0x02|id(8), Flush=0xFF.
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
-        match entry {
-            WalEntry::Insert { id, vector } => {
-                self.file.write_all(&[0x01])?;
-                self.file.write_all(&id.to_le_bytes())?;
-                let dim = vector.len() as u32;
-                self.file.write_all(&dim.to_le_bytes())?;
-                let bytes: &[u8] = bytemuck::cast_slice(vector.as_slice());
-                self.file.write_all(bytes)?;
-            }
-            WalEntry::Delete { id } => {
-                self.file.write_all(&[0x02])?;
-                self.file.write_all(&id.to_le_bytes())?;
-            }
-            WalEntry::Flush => {
-                self.file.write_all(&[0xFF])?;
-            }
-        }
+        let WalEntry::Insert { id, vector } = entry;
+        self.file.write_all(&[0x01])?;
+        self.file.write_all(&id.to_le_bytes())?;
+        let dim = vector.len() as u32;
+        self.file.write_all(&dim.to_le_bytes())?;
+        let bytes: &[u8] = bytemuck::cast_slice(vector.as_slice());
+        self.file.write_all(bytes)?;
         Ok(())
     }
 
-    // Flush BufWriter + fsync. After this returns, entries survive a crash.
     pub fn commit(&mut self) -> Result<(), WalError> {
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
@@ -91,9 +60,7 @@ impl WalWriter {
         Ok(())
     }
 
-    // Replay from start, calling `f` for each decoded entry.
-    // Stops at first corrupt/truncated entry (everything before is intact).
-    // Missing file = nothing to replay (clean shutdown).
+    /// Replay all entries from the WAL, calling `f` for each.
     pub fn replay(path: impl AsRef<Path>, mut f: impl FnMut(WalEntry)) -> Result<(), WalError> {
         let file = match File::open(path.as_ref()) {
             Ok(f) => f,
@@ -123,16 +90,6 @@ impl WalWriter {
                     let vector: Vec<f32> = bytemuck::cast_slice(&vec_bytes).to_vec();
                     off += 8u64 + 4 + (dim * 4) as u64;
                     f(WalEntry::Insert { id, vector });
-                }
-                0x02 => {
-                    let mut id_buf = [0u8; 8];
-                    reader.read_exact(&mut id_buf)?;
-                    let id = u64::from_le_bytes(id_buf);
-                    off += 8;
-                    f(WalEntry::Delete { id });
-                }
-                0xFF => {
-                    f(WalEntry::Flush);
                 }
                 tag => {
                     warn!(
@@ -164,29 +121,15 @@ mod tests {
                 vector: vec![1.0, 2.0, 3.0],
             })
             .unwrap();
-            wal.append(&WalEntry::Delete { id: 2 }).unwrap();
-            wal.append(&WalEntry::Flush).unwrap();
             wal.commit().unwrap();
         }
 
         let mut entries = Vec::new();
         WalWriter::replay(&path, |e| entries.push(e)).unwrap();
-        assert_eq!(entries.len(), 3);
-        match &entries[0] {
-            WalEntry::Insert { id, vector } => {
-                assert_eq!(*id, 1);
-                assert_eq!(vector, &[1.0, 2.0, 3.0]);
-            }
-            _ => panic!("expected Insert"),
-        }
-        match &entries[1] {
-            WalEntry::Delete { id } => assert_eq!(*id, 2),
-            _ => panic!("expected Delete"),
-        }
-        match &entries[2] {
-            WalEntry::Flush => {}
-            _ => panic!("expected Flush"),
-        }
+        assert_eq!(entries.len(), 1);
+        let WalEntry::Insert { id, vector } = &entries[0];
+        assert_eq!(*id, 1);
+        assert_eq!(vector, &[1.0, 2.0, 3.0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -26,7 +26,6 @@ struct Index {
 
 #[pymethods]
 impl Index {
-    // metric: "l2", "cosine", "dot" (case-insensitive, fixed for lifetime).
     #[new]
     fn new(_dims: usize, metric: &str) -> PyResult<Self> {
         let m = match metric {
@@ -40,7 +39,6 @@ impl Index {
         Ok(Self { inner })
     }
 
-    // vector: list[f32], metadata: optional dict[str, str]. Returns auto-assigned u64 ID.
     #[pyo3(signature = (vector, metadata=None))]
     fn insert(&self, py: Python<'_>, vector: Vec<f32>, metadata: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
         let meta = parse_metadata(metadata)?;
@@ -50,8 +48,6 @@ impl Index {
         })
     }
 
-    // query: list[f32], k: int, filter: optional dict[str, str].
-    // Returns list of (id, distance) sorted by increasing distance.
     #[pyo3(signature = (query, k, filter=None))]
     fn search(
         &self,
@@ -70,19 +66,6 @@ impl Index {
     // Delta segment count (excludes sealed — approximate "recent inserts").
     fn __len__(&self) -> usize {
         self.inner.delta_len()
-    }
-
-    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let snap = self.inner.metrics.snapshot();
-        let d = PyDict::new(py);
-        d.set_item("inserts_total", snap.inserts_total)?;
-        d.set_item("searches_total", snap.searches_total)?;
-        d.set_item("compactions_total", snap.compactions_total)?;
-        d.set_item("avg_insert_time_ns", snap.avg_insert_time_ns)?;
-        d.set_item("avg_search_time_ns", snap.avg_search_time_ns)?;
-        d.set_item("delta_size", snap.delta_size)?;
-        d.set_item("num_sealed", snap.num_sealed)?;
-        Ok(d.into())
     }
 }
 
@@ -116,7 +99,6 @@ fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>
     }
 }
 
-// Registers the Index class under the "vivy" namespace.
 #[pymodule]
 fn vivy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Index>()?;

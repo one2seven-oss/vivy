@@ -1,12 +1,7 @@
 pub mod concurrent;
-pub mod error;
-pub mod event;
-#[cfg(feature = "async")]
-pub mod async_index;
 pub mod distance;
+pub mod error;
 pub mod filter;
 pub mod flat;
 pub mod hnsw;
-pub mod metrics;
-pub mod pq;
 pub mod storage;

@@ -22,7 +22,6 @@ rayon = "1"
 rand = "0.9"
 arc-swap = "1"
 parking_lot = "0.12"
-crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"], optional = true }
 prometheus = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time"], optional = true }

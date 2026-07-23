@@ -1,30 +1,3 @@
-//! Sealed segment binary format (mmap'd, zero-copy reads).
-//!
-//! On-disk layout (all integers little-endian):
-//! ```text
-//! HEADER (64 bytes)
-//!   magic:  [u8; 8]  = b"VIVYSEG\0"
-//!   version: u32     = 1
-//!   num_nodes: u32
-//!   dims: u32
-//!   m, m_max: u32
-//!   pq_subvectors: u32  (0 = no PQ)
-//!   pq_enabled: u8
-//!   reserved: [u8; 31]
-//!
-//! OFFSET TABLE (num_nodes × 8 bytes) — relative to NODE DATA start
-//! PQ CODEBOOK (only if pq_enabled) — pq_subvectors × 256 × f32
-//!
-//! NODE DATA (per node, insertion order):
-//!   id: u64, level: u32
-//!   For each layer 0..=level: num_neighbors: u32 + [u32; num_neighbors]
-//!   If pq_enabled: pq_code: [u8; pq_subvectors]
-//!   Else: vector: [f32; dims]
-//! ```
-//!
-//! Offset table enables O(1) random access. Codebook stored inline so
-//! segment files are self-contained.
-
 use bytemuck::{Pod, Zeroable};
 use memmap2::Mmap;
 use std::path::Path;
@@ -33,7 +6,6 @@ use thiserror::Error;
 const MAGIC: [u8; 8] = *b"VIVYSEG\0";
 const CURRENT_VERSION: u32 = 1;
 
-// 64-byte file header. Reserved padding aligns offset table to cache-line boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Header {
@@ -60,7 +32,6 @@ pub enum SegmentError {
     Truncated,
 }
 
-// Snapshot of a node record from a sealed segment.
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
     pub id: u64,
@@ -70,16 +41,16 @@ pub struct NodeRecord {
     pub vector: Option<Vec<f32>>,
 }
 
-// Memory-mapped sealed segment. All reads go directly to mapped memory — no copies.
-// OS page cache handles hot/cold node residency.
 pub struct SealedSegment {
     mmap: Mmap,
     offset_table_off: usize,
     data_off: usize,
     num_nodes: usize,
     dims: usize,
-    _m: usize,
-    _m_max: usize,
+    #[allow(dead_code)]
+    m: usize,
+    #[allow(dead_code)]
+    m_max: usize,
     pq_enabled: bool,
     pq_subvectors: usize,
     has_codebook: bool,
@@ -87,24 +58,22 @@ pub struct SealedSegment {
 }
 
 impl SealedSegment {
-    // Open by path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SegmentError> {
         let file = std::fs::File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
         Self::from_mmap(mmap)
     }
 
-    // Open from existing File handle.
     pub fn from_file(file: std::fs::File) -> Result<Self, SegmentError> {
         let mmap = unsafe { Mmap::map(&file)? };
         Self::from_mmap(mmap)
     }
 
-    // Parse from existing Mmap. Validates header, computes offsets.
     pub fn from_mmap(mmap: Mmap) -> Result<Self, SegmentError> {
         if mmap.len() < size_of::<Header>() {
             return Err(SegmentError::Truncated);
         }
+        // Copy the entire header to avoid borrow on mmap
         let h: Header = bytemuck::pod_read_unaligned(&mmap[..size_of::<Header>()]);
         if h.magic != MAGIC {
             return Err(SegmentError::BadMagic);
@@ -116,8 +85,8 @@ impl SealedSegment {
         let dims = h.dims as usize;
         let pq_enabled = h.pq_enabled != 0;
         let pq_subvectors = h.pq_subvectors as usize;
-        let _m = h.m as usize;
-        let _m_max = h.m_max as usize;
+        let m = h.m as usize;
+        let m_max = h.m_max as usize;
 
         let offset_table_off = size_of::<Header>();
         let offset_table_len = num_nodes * size_of::<u64>();
@@ -140,8 +109,8 @@ impl SealedSegment {
             data_off,
             num_nodes,
             dims,
-            _m,
-            _m_max,
+            m,
+            m_max,
             pq_enabled,
             pq_subvectors,
             has_codebook,
@@ -161,7 +130,6 @@ impl SealedSegment {
         self.pq_enabled
     }
 
-    // Absolute byte position for node idx via offset table + data_off.
     fn offset_of(&self, idx: usize) -> Result<usize, SegmentError> {
         if idx >= self.num_nodes {
             return Err(SegmentError::Truncated);
@@ -171,7 +139,6 @@ impl SealedSegment {
         Ok(self.data_off + rel as usize)
     }
 
-    // Flat f32 codebook if PQ enabled: codebook[subvec × 256 × subdim + centroid × subdim + component].
     pub fn codebook(&self) -> Option<&[f32]> {
         if !self.has_codebook {
             return None;
@@ -182,8 +149,6 @@ impl SealedSegment {
         ))
     }
 
-    // Read full node: id, level, neighbours, PQ code or vector.
-    // For hot-path ADC search, use read_pq_code() instead — skips neighbours.
     pub fn read_node(&self, idx: usize) -> Result<NodeRecord, SegmentError> {
         let start = self.offset_of(idx)?;
         let buf = &self.mmap[start..];
@@ -230,7 +195,6 @@ impl SealedSegment {
         })
     }
 
-    // Fast-path: PQ code only, skips adjacency lists. For ADC-based search.
     pub fn read_pq_code(&self, idx: usize) -> Result<&[u8], SegmentError> {
         let start = self.offset_of(idx)?;
         let buf = &self.mmap[start..];
@@ -244,13 +208,11 @@ impl SealedSegment {
     }
 }
 
-type NodeEntry = (u64, u32, Vec<Vec<u32>>, Vec<f32>);
-
-// Builder for sealed segment files. Push nodes, then write() to finalise.
+#[allow(clippy::type_complexity)]
 pub struct SegmentWriter<W: std::io::Write + std::io::Seek> {
     inner: W,
     header: Header,
-    nodes: Vec<NodeEntry>,
+    nodes: Vec<(u64, u32, Vec<Vec<u32>>, Vec<f32>)>,
 }
 
 impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
@@ -273,7 +235,6 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
         }
     }
 
-    // Buffer a node: id, level, per-layer neighbours, vector.
     pub fn push(&mut self, id: u64, level: u32, neighbors: Vec<Vec<u32>>, vector: Vec<f32>) {
         self.nodes.push((id, level, neighbors, vector));
     }
@@ -282,8 +243,6 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
         self.nodes.len()
     }
 
-    // Two-pass: write header + placeholder offsets → write nodes, tracking actual offsets
-    // → seek back and fill real offsets. Back-seek avoids duplicating serialisation.
     pub fn write(mut self) -> Result<(), std::io::Error> {
         self.header.num_nodes = self.nodes.len() as u32;
         let hdr_bytes: &[u8] = bytemuck::bytes_of(&self.header);
@@ -329,7 +288,6 @@ mod tests {
     use std::io::{BufWriter, Seek, SeekFrom};
     use tempfile::tempfile;
 
-    // Write two nodes, read back, verify all fields.
     #[test]
     fn test_roundtrip() {
         let mut file = tempfile().unwrap();

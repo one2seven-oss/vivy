@@ -1,8 +1,17 @@
+<p align="center">
+  <img src="assets/vivy.png" alt="Vivy">
+</p>
+
+[![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
+[![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
+
 # Vivy Documentation
 
 ## Table of Contents
 
-- [Installation](#installation)
+- [Installation & Build](#installation--build)
 - [Quick Start](#quick-start)
 - [Creating an Index](#creating-an-index)
 - [Inserting Vectors](#inserting-vectors)
@@ -16,7 +25,7 @@
 
 ---
 
-## Installation
+## Installation & Build
 
 ```sh
 pip install maturin
@@ -25,6 +34,15 @@ maturin develop --release
 ```
 
 Requires Python >= 3.8 and a Rust toolchain.
+
+### Build manually
+
+```sh
+git clone https://github.com/your-org/vivy
+cd vivy
+cargo build --release
+cd py && maturin develop --release
+```
 
 ---
 
@@ -164,7 +182,6 @@ idx = vivy.Index(3, "l2")
 idx.insert([1.0, 0.0, 0.0])
 idx.insert([10.0, 0.0, 0.0])
 
-# Query identical to first vector → distance ≈ 0
 results = idx.search([1.0, 0.0, 0.0], k=1)
 assert abs(results[0][1]) < 1e-6
 ```
@@ -175,11 +192,9 @@ assert abs(results[0][1]) < 1e-6
 idx = vivy.Index(2, "cosine")
 idx.insert([1.0, 0.0])
 
-# Orthogonal vectors → distance = 1.0
 results = idx.search([0.0, 1.0], k=1)
 assert abs(results[0][1] - 1.0) < 1e-5
 
-# Identical vectors → distance = 0.0
 results = idx.search([1.0, 0.0], k=1)
 assert abs(results[0][1]) < 1e-6
 ```
@@ -191,9 +206,8 @@ idx = vivy.Index(3, "dot")
 idx.insert([1.0, 0.0, 0.0])
 idx.insert([2.0, 0.0, 0.0])
 
-# Larger dot product → smaller distance (negated)
 results = idx.search([1.0, 0.0, 0.0], k=2)
-assert results[0][0] == 2  # vector with larger magnitude wins
+assert results[0][0] == 2
 ```
 
 ### Choosing a metric
@@ -212,10 +226,7 @@ cos.insert([1.0, 1.0])   # id=2
 
 query = [2.0, 0.0]
 
-# L2 prefers the vector closest in magnitude (id=2)
 print("L2 top:", l2.search(query, k=2))
-
-# Cosine prefers the vector with same direction (id=1)
 print("Cosine top:", cos.search(query, k=2))
 ```
 
@@ -231,7 +242,6 @@ for i in range(100):
     color = "red" if i % 2 == 0 else "blue"
     idx.insert([float(i), 0.0], metadata={"color": color})
 
-# Only return vectors with color="red"
 results = idx.search([50.0, 0.0], k=5, filter={"color": "red"})
 ```
 
@@ -273,15 +283,15 @@ assert idx.search([0.0, 0.0], k=5) == []
 
 ```python
 idx = vivy.Index(2, "l2")
-idx.insert([1.0, 2.0])  # OK — 2-dim
+idx.insert([1.0, 2.0])
 
 try:
-    idx.insert([1.0, 2.0, 3.0])  # 3-dim → ValueError
+    idx.insert([1.0, 2.0, 3.0])
 except ValueError:
     pass
 
 try:
-    idx.search([1.0, 2.0, 3.0], k=5)  # 3-dim query → ValueError
+    idx.search([1.0, 2.0, 3.0], k=5)
 except ValueError:
     pass
 ```
@@ -414,3 +424,15 @@ can operate on the same index concurrently. Inserts do not block searches:
 WAL fsync runs on a background thread, writes to the delta are batched
 (one write lock per 64 inserts), and search snapshots the delta under a
 brief read lock with no lock held during distance computation.
+
+---
+
+## Status
+
+Vivy is in active development. The API is stabilising but may see changes
+before 1.0. Sealed-segment compaction, WAL replay, and the Python bindings
+are exercised in tests but have not yet seen broad production use.
+
+---
+
+*by the dev, for the dev, and of the dev*

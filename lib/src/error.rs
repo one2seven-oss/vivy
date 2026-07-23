@@ -10,18 +10,6 @@ pub enum VivyError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Inconsistent state: {0}")]
-    Inconsistent(String),
-
-    #[error("Index full: {capacity} vectors, cannot insert more")]
-    IndexFull { capacity: usize },
-
-    #[error("Dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
-
-    #[error("Compaction failed: {0}")]
-    Compaction(String),
 }
 
 pub type VivyResult<T> = Result<T, VivyError>;
