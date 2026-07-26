@@ -37,19 +37,20 @@ pub fn compute(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
 
 // Σ (aᵢ − bᵢ)² — squared Euclidean, no sqrt (monotonic, saves one sqrt per cmp).
 // Call sqrt() at the application layer if you need true Euclidean.
+#[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    let mut sum = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
 }
 
 // 1 − cos(θ) = 1 − (a·b) / (|a|·|b|).
 // Returns 1 − similarity so that 0 = identical direction, 1 = orthogonal, 2 = opposite.
 // Denominator clamped at f32::EPSILON for the zero-vector edge case.
+#[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
@@ -65,8 +66,13 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 // −(a·b). For unit-normalised vectors this equals cosine distance without
 // the norm computation. Smaller = closer, so MIP becomes min-negated-dot.
 // Caller must match metric to their embedding model.
+#[inline]
 pub fn neg_dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(&x, &y)| -(x * y)).sum()
+    let mut dot = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+    }
+    -dot
 }
 
 #[cfg(test)]
