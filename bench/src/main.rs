@@ -1,6 +1,6 @@
 use rand::Rng;
-use std::time::Instant;
-use tempfile::tempdir;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 use vivy_core::concurrent::VivyIndex;
 use vivy_core::distance::Metric;
 use vivy_core::flat::FlatIndex;
@@ -16,16 +16,16 @@ fn main() {
     let (data, queries) = generate_data(dims, n, n_queries);
 
     // brute-force index
-    println!("\nBuilding brute-force index ({} vectors)...", n);
-    let start = Instant::now();
+    println!("\nBuilding brute-force index ({n} vectors)...");
+    let t = Instant::now();
     let mut flat = FlatIndex::new(Metric::L2);
     for (i, v) in data.iter().enumerate() {
         flat.insert(i as u64, v.clone());
     }
-    let flat_time = start.elapsed();
-    println!("  flat build: {:?}", flat_time);
+    let flat_time = t.elapsed();
+    println!("  flat build: {flat_time:?}");
 
-    // Compute ground truth
+    // exact k-NN via full scan
     println!("Computing ground truth...");
     let gt: Vec<Vec<u64>> = queries
         .iter()
@@ -33,60 +33,64 @@ fn main() {
         .collect();
     drop(flat);
 
-    // Build HNSW index
+    // HNSW index
     println!("\nBuilding HNSW index...");
-    let _dir = tempdir().unwrap();
-    let start = Instant::now();
-    let idx = VivyIndex::new(Metric::L2, Option::<&str>::None, Option::<&str>::None).unwrap();
+    let t = Instant::now();
+    let idx = VivyIndex::new(Metric::L2, None::<&str>, None::<&str>).unwrap();
     for v in &data {
-        idx.insert(v.clone()).unwrap();
+        black_box(idx.insert(black_box(v.clone()))).unwrap();
     }
-    let index_time = start.elapsed();
+    let index_time = t.elapsed();
     println!(
-        "  hnsw build: {:?} ({} vec/s)",
-        index_time,
-        n as f64 / index_time.as_secs_f64()
+        "  hnsw build: {index_time:?} ({:.0} vec/s)",
+        n as f64 / index_time.as_secs_f64(),
     );
 
-    // Warmup
-    for q in &queries[..10] {
-        let _ = idx.search(q, k);
+    // 10 queries
+    for q in queries.iter().take(10) {
+        black_box(idx.search(q, k));
     }
 
-    // Recall benchmark
-    println!("\nRecall@{} benchmark ({} queries)...", k, n_queries);
-    let start = Instant::now();
+    // Recall & latency
+    println!("\nRecall@{k} benchmark ({n_queries} queries)...");
+    let t = Instant::now();
     let mut hits = 0usize;
+    let mut search_latency = Duration::ZERO;
     for (i, q) in queries.iter().enumerate() {
+        let tq = Instant::now();
         let results = idx.search(q, k);
-        let result_ids: Vec<u64> = results.into_iter().map(|(id, _)| id).collect();
+        search_latency += tq.elapsed();
+
         for gt_id in &gt[i] {
-            if result_ids.contains(gt_id) {
+            if results.iter().any(|(id, _)| id == gt_id) {
                 hits += 1;
             }
         }
     }
-    let elapsed = start.elapsed();
+    let elapsed = t.elapsed();
     let total_possible = n_queries * k;
     let recall = hits as f64 / total_possible as f64;
     let qps = n_queries as f64 / elapsed.as_secs_f64();
 
-    println!("  recall@{}: {:.4}", k, recall);
-    println!("  total time: {:?}", elapsed);
-    println!("  QPS: {:.1}", qps);
+    println!("  recall@{k}: {recall:.4}");
+    println!("  total time: {elapsed:?}");
+    println!("  QPS: {qps:.1}");
     println!(
         "  p50 latency: {:.2}ms",
-        (elapsed.as_secs_f64() / n_queries as f64) * 1000.0
+        search_latency.as_secs_f64() / n_queries as f64 * 1000.0,
     );
+
+    let data_mb = (n * dims * 4) as f64 / 1_048_576.0;
+    println!("\n  data: {n} x {dims}-dim f32 = {data_mb:.2} MB");
 }
 
 fn generate_data(dims: usize, n: usize, nq: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = rand::rng();
     let data: Vec<Vec<f32>> = (0..n)
-        .map(|_| (0..dims).map(|_| rng.random::<f32>()).collect())
+        .map(|_| (0..dims).map(|_| rng.random()).collect())
         .collect();
     let queries: Vec<Vec<f32>> = (0..nq)
-        .map(|_| (0..dims).map(|_| rng.random::<f32>()).collect())
+        .map(|_| (0..dims).map(|_| rng.random()).collect())
         .collect();
     (data, queries)
 }
