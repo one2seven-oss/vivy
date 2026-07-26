@@ -69,7 +69,7 @@ impl VivyIndex {
 
     /// Insert with auto-generated ID
     pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
@@ -104,7 +104,7 @@ impl VivyIndex {
         vector: Vec<f32>,
         metadata: Vec<(String, String)>,
     ) -> Result<u64, WalError> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
@@ -148,14 +148,10 @@ impl VivyIndex {
             return Vec::new();
         }
 
-        let metric = self.delta.read().metric();
-        let mut results: Vec<(u64, f32)>;
-
-        // Search delta
-        {
+        let (mut results, metric) = {
             let guard = self.delta.read();
-            results = guard.search_filtered(query, k, filter_bitmap.as_ref());
-        }
+            (guard.search_filtered(query, k, filter_bitmap.as_ref()), guard.metric())
+        };
 
         // Search sealed segments
         let sealed_list = self.sealed.load();
@@ -183,13 +179,10 @@ impl VivyIndex {
 
     /// Search across delta + all sealed segments.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let metric = self.delta.read().metric();
-        let mut results: Vec<(u64, f32)>;
-
-        {
+        let (mut results, metric) = {
             let guard = self.delta.read();
-            results = guard.search(query, k);
-        }
+            (guard.search(query, k), guard.metric())
+        };
 
         let sealed_list = self.sealed.load();
         for seg in sealed_list.iter() {
@@ -229,7 +222,7 @@ impl VivyIndex {
 
 impl Drop for VivyIndex {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -244,7 +237,7 @@ fn compactor_loop(
     metric: Metric,
 ) {
     let threshold = 10_000usize;
-    while running.load(Ordering::SeqCst) {
+    while running.load(Ordering::Acquire) {
         thread::sleep(Duration::from_secs(5));
         if delta.read().len() >= threshold {
             if let Some(ref dir) = data_dir {
