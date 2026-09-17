@@ -368,21 +368,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memory"
-version = "0.1.0"
-dependencies = [
- "log",
- "parking_lot",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "uuid",
- "vivy-core",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -887,11 +872,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vivy-memory"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+ "vivy-core",
+]
+
+[[package]]
 name = "vivy-py"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "serde_json",
  "vivy-core",
+ "vivy-memory",
 ]
 
 [[package]]

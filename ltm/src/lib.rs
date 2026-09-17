@@ -10,8 +10,8 @@ pub use config::MemoryConfig;
 pub use error::{ErrorCode, MemoryError, Result};
 pub use index_adapter::{InMemoryTestIndex, VectorIndex, VivyVectorIndex};
 pub use model::{
-    MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus, RecallExplanation, RecallItem,
-    RecallRequest, RecallResponse, RememberRequest,
+    ForgetRequest, MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus, RecallExplanation,
+    RecallItem, RecallRequest, RecallResponse, RememberRequest, UpdateRequest,
 };
 pub use namespace::MemoryScope;
 pub use repository::Repository;
@@ -122,45 +122,38 @@ impl MemoryStore {
 
         for (mem_id, distance) in candidates {
             if let Some(record) = self.repo.get_by_scope_and_id(&req.scope, &mem_id)? {
-                // Must be active
                 if record.status != MemoryStatus::Active {
                     continue;
                 }
 
-                // Check expiry
                 if let Some(exp) = record.expires_at_ms {
                     if now_ms >= exp {
                         continue;
                     }
                 }
 
-                // Filter by kind
                 if let Some(ref kinds) = req.filters.kinds {
                     if !kinds.contains(&record.kind) {
                         continue;
                     }
                 }
 
-                // Filter by min importance
                 if let Some(min_imp) = req.filters.min_importance {
                     if record.importance < min_imp {
                         continue;
                     }
                 }
 
-                // Cosine similarity in [0, 1]
                 let similarity = (1.0 - (distance / 2.0)).clamp(0.0, 1.0);
                 let importance = record.importance.clamp(0.0, 1.0);
 
-                // Recency decay: exponential decay with half-life of 7 days (604,800,000 ms)
+                // 7-day half-life decay (604_800_000 ms)
                 let age_ms = (now_ms - record.created_at_ms).max(0) as f32;
                 let recency_decay = (-age_ms / (7.0 * 86_400_000.0)).exp();
 
-                // Reinforcement score based on access count
                 let reinforcement = (record.access_count as f32 / 10.0).clamp(0.0, 1.0);
 
-                // Default recall scoring formula from 04-api-contract.md:
-                // score = 0.70 * similarity + 0.15 * importance + 0.10 * recency_decay + 0.05 * reinforcement
+                // 04-api-contract: 0.70*sim + 0.15*imp + 0.10*recency + 0.05*reinforcement
                 let total_score = 0.70 * similarity
                     + 0.15 * importance
                     + 0.10 * recency_decay
@@ -184,19 +177,122 @@ impl MemoryStore {
                     score: total_score,
                     explanation,
                 });
-
-                if items.len() == req.limit {
-                    break;
-                }
             }
         }
 
-        // Sort items by total score descending
-        items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        // Apply MMR diversity if mmr_lambda is specified
+        if let Some(lambda) = req.mmr_lambda {
+            let mut selected: Vec<RecallItem> = Vec::new();
+            let mut remaining = items;
 
-        Ok(RecallResponse {
-            total_candidates: items.len(),
-            items,
-        })
+            while !remaining.is_empty() && selected.len() < req.limit {
+                let mut best_idx = 0;
+                let mut best_mmr_score = f32::NEG_INFINITY;
+
+                for (idx, candidate) in remaining.iter().enumerate() {
+                    // Relevance term
+                    let rel = candidate.score;
+
+                    // Redundancy term: max similarity to already selected items
+                    let mut max_sim = 0.0f32;
+                    for sel in &selected {
+                        let dist = vivy_core::distance::cosine(
+                            &candidate.memory.embedding,
+                            &sel.memory.embedding,
+                        );
+                        let sim = (1.0 - dist).clamp(0.0, 1.0);
+                        if sim > max_sim {
+                            max_sim = sim;
+                        }
+                    }
+
+                    // MMR formula: lambda * rel - (1 - lambda) * max_sim
+                    let mmr_score = lambda * rel - (1.0 - lambda) * max_sim;
+                    if mmr_score > best_mmr_score {
+                        best_mmr_score = mmr_score;
+                        best_idx = idx;
+                    }
+                }
+
+                let chosen = remaining.remove(best_idx);
+                selected.push(chosen);
+            }
+
+            Ok(RecallResponse {
+                total_candidates: selected.len(),
+                items: selected,
+            })
+        } else {
+            // Sort items by total score descending
+            items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            items.truncate(req.limit);
+
+            Ok(RecallResponse {
+                total_candidates: items.len(),
+                items,
+            })
+        }
+    }
+
+    /// Update an existing memory record with optimistic concurrency.
+    pub fn update(&self, req: UpdateRequest) -> Result<()> {
+        req.validate(self.config.dimensions())?;
+
+        let existing = self
+            .repo
+            .get_by_scope_and_id(&req.scope, &req.id)?
+            .ok_or_else(|| MemoryError::not_found(&req.id))?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let new_content = req.content.unwrap_or(existing.content);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&new_content, &mut hasher);
+        let new_content_hash = std::hash::Hasher::finish(&hasher).to_le_bytes().to_vec();
+
+        let new_embedding = req.embedding.unwrap_or(existing.embedding);
+        let new_kind = req.kind.unwrap_or(existing.kind);
+        let new_importance = req.importance.unwrap_or(existing.importance);
+        let new_expires_at = req.expires_at_ms.unwrap_or(existing.expires_at_ms);
+
+        let mut new_metadata = existing.metadata;
+        if let Some(patch) = req.metadata_patch {
+            for (k, v) in patch {
+                new_metadata.insert(k, v);
+            }
+        }
+
+        let updated_record = MemoryRecord {
+            id: req.id,
+            scope: req.scope,
+            kind: new_kind,
+            content: new_content,
+            content_hash: new_content_hash,
+            embedding: new_embedding,
+            embedding_model: self.config.embedding_model().to_string(),
+            embedding_dims: self.config.dimensions(),
+            importance: new_importance,
+            created_at_ms: existing.created_at_ms,
+            updated_at_ms: now_ms,
+            last_accessed_at_ms: existing.last_accessed_at_ms,
+            access_count: existing.access_count,
+            expires_at_ms: new_expires_at,
+            status: MemoryStatus::Active,
+            revision: existing.revision + 1,
+            metadata: new_metadata,
+            source: existing.source,
+        };
+
+        self.coordinator
+            .coordinate_update(updated_record, req.expected_revision, req.operation_id)
+    }
+
+    /// Forget/delete a memory record immediately hiding it from reads.
+    pub fn forget(&self, req: ForgetRequest) -> Result<()> {
+        self.coordinator
+            .coordinate_forget(&req.scope, &req.id, req.operation_id)
     }
 }

@@ -133,8 +133,166 @@ fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>
     }
 }
 
+// ---------------------------------------------------------------------------
+// Python facade for vivy_memory::MemoryStore
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "MemoryStore")]
+struct PyMemoryStore {
+    inner: std::sync::Arc<vivy_memory::MemoryStore>,
+}
+
+#[pymethods]
+impl PyMemoryStore {
+    #[staticmethod]
+    #[pyo3(signature = (path, dimensions, embedding_model, max_recall_limit=100))]
+    fn open(
+        path: &str,
+        dimensions: usize,
+        embedding_model: &str,
+        max_recall_limit: usize,
+    ) -> PyResult<Self> {
+        let config = vivy_memory::MemoryConfig::builder(path)
+            .dimensions(dimensions)
+            .embedding_model(embedding_model)
+            .max_recall_limit(max_recall_limit)
+            .build()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let store = vivy_memory::MemoryStore::open(config)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        Ok(Self {
+            inner: std::sync::Arc::new(store),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (tenant_id, namespace, content, embedding, kind="fact", importance=0.5, agent_id=None, user_id=None, operation_id=None, expires_at_ms=None))]
+    fn remember(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        content: &str,
+        embedding: Vec<f32>,
+        kind: &str,
+        importance: f32,
+        agent_id: Option<&str>,
+        user_id: Option<&str>,
+        operation_id: Option<String>,
+        expires_at_ms: Option<i64>,
+    ) -> PyResult<String> {
+        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(agent) = agent_id {
+            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        if let Some(user) = user_id {
+            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+
+        let m_kind = match kind.to_lowercase().as_str() {
+            "preference" => vivy_memory::MemoryKind::Preference,
+            "fact" => vivy_memory::MemoryKind::Fact,
+            "instruction" => vivy_memory::MemoryKind::Instruction,
+            "context" => vivy_memory::MemoryKind::Context,
+            _ => vivy_memory::MemoryKind::Episodic,
+        };
+
+        let req = vivy_memory::RememberRequest {
+            operation_id,
+            scope,
+            content: content.to_string(),
+            embedding,
+            kind: m_kind,
+            importance,
+            expires_at_ms,
+            metadata: std::collections::HashMap::new(),
+            source: std::collections::HashMap::new(),
+        };
+
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .remember(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (tenant_id, namespace, query_embedding, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None))]
+    fn recall(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        query_embedding: Vec<f32>,
+        limit: usize,
+        agent_id: Option<&str>,
+        user_id: Option<&str>,
+        include_explanations: bool,
+        mmr_lambda: Option<f32>,
+    ) -> PyResult<Vec<(String, String, f32)>> {
+        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(agent) = agent_id {
+            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        if let Some(user) = user_id {
+            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+
+        let req = vivy_memory::RecallRequest {
+            scope,
+            query_embedding,
+            limit,
+            filters: vivy_memory::MemoryFilter::default(),
+            include_explanations,
+            mmr_lambda,
+        };
+
+        let store = self.inner.clone();
+        let resp = py.allow_threads(move || {
+            store
+                .recall(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+
+        let results = resp
+            .items
+            .into_iter()
+            .map(|item| (item.memory.id, item.memory.content, item.score))
+            .collect();
+
+        Ok(results)
+    }
+
+    #[pyo3(signature = (tenant_id, namespace, id))]
+    fn forget(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        id: &str,
+    ) -> PyResult<()> {
+        let scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let req = vivy_memory::ForgetRequest::new(scope, id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .forget(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+}
+
 #[pymodule]
 fn vivy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Index>()?;
+    m.add_class::<PyMemoryStore>()?;
     Ok(())
 }

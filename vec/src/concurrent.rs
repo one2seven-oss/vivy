@@ -201,7 +201,7 @@ impl VivyIndex {
             }
         }
 
-        for (id, vector) in ids.iter().zip(vectors.into_iter()) {
+        for (id, vector) in ids.iter().zip(vectors) {
             let shard = shard_idx(*id, NUM_SHARDS);
             self.shards[shard].write().insert(*id, vector);
         }

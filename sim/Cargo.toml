@@ -7,5 +7,5 @@ description = "Benchmarking harness for Vivy"
 publish = false
 
 [dependencies]
-vivy-core = { path = "../lib" }
+vivy-core = { path = "../vec" }
 rand = "0.9"

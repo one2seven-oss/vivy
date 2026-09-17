@@ -18,5 +18,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo test -p vivy-core -p vivy-bench
-      - run: cargo clippy -p vivy-core -p vivy-bench -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace -- -D warnings

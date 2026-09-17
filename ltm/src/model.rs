@@ -130,6 +130,73 @@ impl MemoryFilter {
     }
 }
 
+/// Request to update an existing memory record with optimistic revision concurrency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRequest {
+    pub operation_id: Option<String>,
+    pub scope: MemoryScope,
+    pub id: String,
+    pub expected_revision: u64,
+    pub content: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub kind: Option<MemoryKind>,
+    pub importance: Option<f32>,
+    pub expires_at_ms: Option<Option<i64>>,
+    pub metadata_patch: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl UpdateRequest {
+    pub fn validate(&self, expected_dims: usize) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(MemoryError::invalid_input("id cannot be empty"));
+        }
+        if let Some(ref c) = self.content {
+            if c.trim().is_empty() {
+                return Err(MemoryError::invalid_input("content cannot be empty"));
+            }
+        }
+        if let Some(ref emb) = self.embedding {
+            if emb.len() != expected_dims {
+                return Err(MemoryError::DimensionMismatch {
+                    code: crate::error::ErrorCode::DimensionMismatch,
+                    expected: expected_dims,
+                    actual: emb.len(),
+                });
+            }
+        }
+        if let Some(imp) = self.importance {
+            if !(0.0..=1.0).contains(&imp) {
+                return Err(MemoryError::invalid_input(
+                    "importance must be between 0.0 and 1.0",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Request to delete/forget a memory record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgetRequest {
+    pub operation_id: Option<String>,
+    pub scope: MemoryScope,
+    pub id: String,
+}
+
+impl ForgetRequest {
+    pub fn new(scope: MemoryScope, id: impl Into<String>) -> Result<Self> {
+        let id = id.into().trim().to_string();
+        if id.is_empty() {
+            return Err(MemoryError::invalid_input("id cannot be empty"));
+        }
+        Ok(Self {
+            operation_id: None,
+            scope,
+            id,
+        })
+    }
+}
+
 /// Request to recall memories for an agent context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallRequest {
@@ -138,6 +205,7 @@ pub struct RecallRequest {
     pub limit: usize,
     pub filters: MemoryFilter,
     pub include_explanations: bool,
+    pub mmr_lambda: Option<f32>,
 }
 
 impl RecallRequest {
@@ -151,6 +219,13 @@ impl RecallRequest {
                 expected: expected_dims,
                 actual: self.query_embedding.len(),
             });
+        }
+        if let Some(lambda) = self.mmr_lambda {
+            if !(0.0..=1.0).contains(&lambda) {
+                return Err(MemoryError::invalid_input(
+                    "mmr_lambda must be between 0.0 and 1.0",
+                ));
+            }
         }
         Ok(())
     }

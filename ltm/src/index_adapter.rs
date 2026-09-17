@@ -232,21 +232,7 @@ impl VectorIndex for InMemoryTestIndex {
         let mut scored: Vec<(String, f32)> = map
             .iter()
             .map(|(id, vec)| {
-                // compute cosine distance = 1.0 - cosine similarity
-                let mut dot = 0.0f32;
-                let mut norm_a = 0.0f32;
-                let mut norm_b = 0.0f32;
-                for (a, b) in query.iter().zip(vec.iter()) {
-                    dot += a * b;
-                    norm_a += a * a;
-                    norm_b += b * b;
-                }
-                let sim = if norm_a > 0.0 && norm_b > 0.0 {
-                    dot / (norm_a.sqrt() * norm_b.sqrt())
-                } else {
-                    0.0
-                };
-                let dist = 1.0 - sim;
+                let dist = vivy_core::distance::cosine(query, vec);
                 (id.clone(), dist)
             })
             .collect();

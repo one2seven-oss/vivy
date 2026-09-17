@@ -136,17 +136,17 @@ impl Repository {
 
     pub fn integrity_check(&self) -> Result<()> {
         let conn = self.conn.lock();
-        let result: String = conn
+        let check_status: String = conn
             .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
                 message: format!("Failed to run PRAGMA integrity_check: {}", e),
             })?;
 
-        if result.to_lowercase() != "ok" {
+        if check_status.to_lowercase() != "ok" {
             return Err(MemoryError::CorruptStore {
                 code: ErrorCode::CorruptStore,
-                message: format!("SQLite integrity check failed: {}", result),
+                message: format!("SQLite integrity check failed: {}", check_status),
             });
         }
         Ok(())
@@ -642,6 +642,166 @@ impl Repository {
             })?);
         }
         Ok(records)
+    }
+
+    pub fn update_memory(
+        &self,
+        record: &MemoryRecord,
+        expected_revision: u64,
+        operation_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin update transaction: {}", e),
+        })?;
+
+        // Verify current revision and scope
+        let (current_revision, current_status): (i64, String) = tx
+            .query_row(
+                "SELECT revision, status FROM memories WHERE id = ? AND tenant_id = ? AND namespace = ?",
+                params![record.id, record.scope.tenant_id(), record.scope.namespace()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to fetch current revision: {}", e),
+            })?
+            .ok_or_else(|| MemoryError::not_found(&record.id))?;
+
+        if current_status == "deleted" {
+            return Err(MemoryError::not_found(&record.id));
+        }
+
+        if current_revision as u64 != expected_revision {
+            return Err(MemoryError::RevisionConflict {
+                code: ErrorCode::RevisionConflict,
+                id: record.id.clone(),
+                expected: expected_revision,
+                current: current_revision as u64,
+            });
+        }
+
+        let embedding_bytes: Vec<u8> = record
+            .embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let metadata_json = serde_json::to_string(&record.metadata).unwrap_or_else(|_| "{}".into());
+
+        tx.execute(
+            r#"
+            UPDATE memories SET
+                content = ?,
+                content_hash = ?,
+                embedding = ?,
+                importance = ?,
+                updated_at_ms = ?,
+                expires_at_ms = ?,
+                status = ?,
+                revision = ?,
+                metadata_json = ?
+            WHERE id = ? AND revision = ?
+            "#,
+            params![
+                record.content.as_bytes(),
+                record.content_hash,
+                embedding_bytes,
+                record.importance,
+                record.updated_at_ms,
+                record.expires_at_ms,
+                record.status.as_str(),
+                (expected_revision + 1) as i64,
+                metadata_json,
+                record.id,
+                expected_revision as i64,
+            ],
+        )
+        .map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to update memory record: {}", e),
+        })?;
+
+        if let Some(op_id) = operation_id {
+            tx.execute(
+                r#"
+                INSERT INTO operations (
+                    operation_id, memory_id, kind, payload_json, state, created_at_ms, applied_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                "#,
+                params![
+                    op_id,
+                    record.id,
+                    "update",
+                    serde_json::to_string(record).unwrap_or_else(|_| "{}".into()),
+                    "pending",
+                    now_ms,
+                ],
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to record update operation: {}", e),
+            })?;
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit update transaction: {}", e),
+        })?;
+
+        Ok(())
+    }
+
+    pub fn delete_memory(
+        &self,
+        scope: &MemoryScope,
+        id: &str,
+        operation_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin delete transaction: {}", e),
+        })?;
+
+        tx.execute(
+            r#"
+            UPDATE memories SET
+                status = 'deleted',
+                updated_at_ms = ?
+            WHERE id = ? AND tenant_id = ? AND namespace = ?
+            "#,
+            params![now_ms, id, scope.tenant_id(), scope.namespace()],
+        )
+        .map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to tombstone memory: {}", e),
+        })?;
+
+        if let Some(op_id) = operation_id {
+            tx.execute(
+                r#"
+                INSERT INTO operations (
+                    operation_id, memory_id, kind, payload_json, state, created_at_ms, applied_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+                params![op_id, id, "delete", "{}", "applied", now_ms, now_ms],
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to insert delete operation: {}", e),
+            })?;
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit delete transaction: {}", e),
+        })?;
+
+        Ok(())
     }
 }
 
