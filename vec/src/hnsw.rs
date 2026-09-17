@@ -275,7 +275,7 @@ impl HnswIndex {
         &self,
         query: &[f32],
         k: usize,
-        filter: Option<&roaring::RoaringBitmap>,
+        filter: Option<&roaring::RoaringTreemap>,
     ) -> Vec<(u64, f32)> {
         let ep = match self.entry {
             Some(e) => e,
@@ -298,7 +298,7 @@ impl HnswIndex {
                 .collect();
 
             if let Some(bitmap) = filter {
-                results.retain(|(id, _)| bitmap.contains(*id as u32));
+                results.retain(|(id, _)| bitmap.contains(*id));
             }
 
             if results.len() >= k || ef >= max_ef {

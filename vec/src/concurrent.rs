@@ -1,6 +1,7 @@
 use crate::distance::{self, Metric};
 use crate::filter::{FilterExpr, FilterIndex};
 use crate::hnsw::HnswIndex;
+use crate::storage::manifest::Manifest;
 use crate::storage::segments::{SealedSegment, SegmentWriter};
 use crate::storage::wal::{WalEntry, WalError, WalWriter};
 use arc_swap::ArcSwap;
@@ -32,7 +33,7 @@ pub struct VivyIndex {
     pub(crate) shards: Arc<Vec<RwLock<HnswIndex>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     pub(crate) filter_index: RwLock<FilterIndex>,
-    wal: Option<Mutex<WalWriter>>,
+    wal: Option<Arc<Mutex<WalWriter>>>,
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     pub(crate) next_id: AtomicU64,
@@ -46,30 +47,94 @@ impl VivyIndex {
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
     ) -> Result<Self, WalError> {
-        let wal = wal_path
-            .as_ref()
-            .map(WalWriter::open)
-            .transpose()?
-            .map(Mutex::new);
-        let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
-
-        let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
-            Arc::new(ArcSwap::new(Arc::new(Vec::new())));
-
         let shards = (0..NUM_SHARDS)
             .map(|_| RwLock::new(HnswIndex::new(dims, metric)))
             .collect::<Vec<_>>();
         let shards = Arc::new(shards);
+
+        let mut next_id = 1u64;
+
+        // 1. Replay uncompacted WAL entries if existing WAL is present
+        if let Some(ref path) = wal_path {
+            WalWriter::replay(path.as_ref(), |entry| match entry {
+                WalEntry::Insert { id, vector } => {
+                    let shard = shard_idx(id, NUM_SHARDS);
+                    shards[shard].write().insert(id, vector);
+                    if id >= next_id {
+                        next_id = id.saturating_add(1);
+                    }
+                }
+            })?;
+        }
+
+        let wal = wal_path
+            .as_ref()
+            .map(WalWriter::open)
+            .transpose()?
+            .map(|w| Arc::new(Mutex::new(w)));
+        let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
+
+        // 2. Discover existing sealed segments in data directory using manifest
+        let mut initial_sealed = Vec::new();
+        if let Some(ref dir) = data_dir {
+            if dir.exists() {
+                let manifest = Manifest::load(dir).unwrap_or(None);
+                let seg_files: Vec<String> = match manifest {
+                    Some(m) => m.segments,
+                    None => {
+                        let mut found = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.extension().and_then(|s| s.to_str()) == Some("vivy") {
+                                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                        found.push(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        found.sort();
+                        if !found.is_empty() {
+                            let m = Manifest::new(found.clone());
+                            let _ = m.save(dir);
+                        }
+                        found
+                    }
+                };
+
+                for fname in seg_files {
+                    let path = dir.join(&fname);
+                    match SealedSegment::open(&path) {
+                        Ok(seg) => {
+                            for idx in 0..seg.num_nodes() {
+                                if let Ok(id) = seg.id_at(idx) {
+                                    if id >= next_id {
+                                        next_id = id.saturating_add(1);
+                                    }
+                                }
+                            }
+                            initial_sealed.push(Arc::new(seg));
+                        }
+                        Err(e) => {
+                            warn!("Failed to open existing sealed segment {:?}: {:?}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
+            Arc::new(ArcSwap::new(Arc::new(initial_sealed)));
 
         let mut idx = Self {
             dims,
             shards: shards.clone(),
             sealed: sealed.clone(),
             filter_index: RwLock::new(FilterIndex::new()),
-            wal,
+            wal: wal.clone(),
             running: Arc::new(AtomicBool::new(true)),
             handle: None,
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(next_id),
             data_dir,
         };
 
@@ -80,7 +145,7 @@ impl VivyIndex {
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, dims, shards, sealed, dir, m))
+            .spawn(move || compactor_loop(running, dims, shards, sealed, dir, wal, m))
             .expect("compactor thread");
         idx.handle = Some(h);
 
@@ -92,7 +157,7 @@ impl VivyIndex {
         if vector.len() != self.dims {
             return Err(VivyError::DimensionMismatch);
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
@@ -108,11 +173,13 @@ impl VivyIndex {
         Ok(id)
     }
 
-    /// Insert with explicit ID
+    /// Insert with explicit ID, advancing the next_id high-water mark to prevent collisions.
     pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), VivyError> {
         if vector.len() != self.dims {
             return Err(VivyError::DimensionMismatch);
         }
+        self.next_id.fetch_max(id.saturating_add(1), Ordering::SeqCst);
+
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
             wal.append(&WalEntry::Insert {
@@ -251,7 +318,7 @@ impl VivyIndex {
                 if let Ok(id) = seg.id_at(idx) {
                     let passes_filter = filter_bitmap
                         .as_ref()
-                        .is_none_or(|bm| bm.contains(id as u32));
+                        .is_none_or(|bm| bm.contains(id));
                     if !passes_filter {
                         continue;
                     }
@@ -312,7 +379,8 @@ impl VivyIndex {
     pub fn compact_now(&self) {
         if let Some(ref dir) = self.data_dir {
             let m = self.shards[0].read().metric();
-            if let Err(e) = run_compaction(self.dims, &self.shards, &self.sealed, dir, m) {
+            let wal_ref = self.wal.as_deref();
+            if let Err(e) = run_compaction(self.dims, &self.shards, &self.sealed, dir, wal_ref, m) {
                 warn!("compaction failed: {e}");
             }
         }
@@ -334,6 +402,7 @@ fn compactor_loop(
     shards: Arc<Vec<RwLock<HnswIndex>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     data_dir: Option<PathBuf>,
+    wal: Option<Arc<Mutex<WalWriter>>>,
     metric: Metric,
 ) {
     let threshold = 10_000usize;
@@ -342,7 +411,8 @@ fn compactor_loop(
         let total_len: usize = shards.iter().map(|s| s.read().len()).sum();
         if total_len >= threshold {
             if let Some(ref dir) = data_dir {
-                if let Err(e) = run_compaction(dims, &shards, &sealed, dir, metric) {
+                let wal_ref = wal.as_deref();
+                if let Err(e) = run_compaction(dims, &shards, &sealed, dir, wal_ref, metric) {
                     warn!("compaction failed: {e}");
                 }
             }
@@ -355,6 +425,7 @@ fn run_compaction(
     shards: &[RwLock<HnswIndex>],
     sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
     data_dir: &Path,
+    wal: Option<&Mutex<WalWriter>>,
     metric: Metric,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut entries = Vec::new();
@@ -371,7 +442,8 @@ fn run_compaction(
     }
     info!("compacting {} vectors into sealed segment", entries.len());
 
-    let seg_path = data_dir.join(format!("seg-{}.vivy", timestamp_ns()));
+    let seg_filename = format!("seg-{}.vivy", timestamp_ns());
+    let seg_path = data_dir.join(&seg_filename);
     let file = std::fs::File::create(&seg_path)?;
     let writer = BufWriter::new(file.try_clone()?);
 
@@ -381,6 +453,17 @@ fn run_compaction(
     }
     seg_writer.write()?;
     drop(file);
+
+    // Atomically record newly sealed segment in manifest
+    let mut manifest = Manifest::load(data_dir)?.unwrap_or_else(|| Manifest::new(Vec::new()));
+    manifest.segments.push(seg_filename);
+    manifest.save(data_dir)?;
+
+    // Reset WAL to clear compacted delta entries
+    if let Some(wal_mutex) = wal {
+        let mut wal_guard = wal_mutex.lock();
+        wal_guard.reset()?;
+    }
 
     let new_seg = Arc::new(SealedSegment::open(&seg_path)?);
 
@@ -464,5 +547,85 @@ mod tests {
 
         let res = idx.search(&v1, 1).unwrap();
         assert_eq!(res[0].0, 1);
+    }
+
+    #[test]
+    fn test_64bit_id_preservation_and_filtering() {
+        let dir = tempdir().unwrap();
+        let wal = dir.path().join("test.wal");
+        let data = dir.path().join("segments");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let large_id_1 = (1u64 << 40) + 123;
+        let large_id_2 = u64::MAX - 99;
+
+        idx.insert_with_id(large_id_1, vec![1.0, 0.0, 0.0]).unwrap();
+        idx.insert_with_id(large_id_2, vec![0.0, 1.0, 0.0]).unwrap();
+
+        // Check search returns exact 64-bit IDs without truncation
+        let res = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(res[0].0, large_id_1);
+
+        let res2 = idx.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(res2[0].0, large_id_2);
+
+        // Compact to sealed segment and verify 64-bit IDs in sealed segment
+        idx.compact_now();
+        assert_eq!(idx.num_sealed(), 1);
+
+        let res_sealed = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(res_sealed[0].0, large_id_1);
+    }
+
+    #[test]
+    fn test_explicit_id_high_water_mark() {
+        let dir = tempdir().unwrap();
+        let wal = dir.path().join("test.wal");
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Option::<&Path>::None).unwrap();
+
+        idx.insert_with_id(500, vec![1.0, 0.0, 0.0]).unwrap();
+        let auto_id = idx.insert(vec![0.0, 1.0, 0.0]).unwrap();
+        assert!(auto_id > 500, "auto-generated ID must be strictly greater than explicit high-water mark, got {}", auto_id);
+    }
+
+    #[test]
+    fn test_reopen_wal_and_sealed_recovery() {
+        let dir = tempdir().unwrap();
+        let wal = dir.path().join("test.wal");
+        let data = dir.path().join("segments");
+        std::fs::create_dir_all(&data).unwrap();
+
+        {
+            let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+            idx.insert_with_id(10, vec![1.0, 0.0, 0.0]).unwrap();
+            idx.insert_with_id(20, vec![0.0, 1.0, 0.0]).unwrap();
+            // Compact 10 & 20 into a sealed segment
+            idx.compact_now();
+            assert_eq!(idx.num_sealed(), 1);
+
+            // Insert 30 into WAL (uncompacted delta)
+            idx.insert_with_id(30, vec![0.0, 0.0, 1.0]).unwrap();
+            assert_eq!(idx.delta_len(), 1);
+        }
+
+        // Reopen index from the same directory & wal
+        let reopened = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        assert_eq!(reopened.num_sealed(), 1);
+        assert_eq!(reopened.delta_len(), 1);
+
+        // Search for all 3 vectors
+        let res1 = reopened.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(res1[0].0, 10);
+
+        let res2 = reopened.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(res2[0].0, 20);
+
+        let res3 = reopened.search(&[0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(res3[0].0, 30);
+
+        // Verify high-water mark after reopen
+        let next_auto = reopened.insert(vec![0.5, 0.5, 0.0]).unwrap();
+        assert!(next_auto > 30, "next auto ID must be > 30, got {}", next_auto);
     }
 }

@@ -6,6 +6,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    let (chunks, _) = bytes.as_chunks::<4>();
+    chunks.iter().map(|&chunk| f32::from_le_bytes(chunk)).collect()
+}
+
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -316,10 +321,7 @@ impl Repository {
                     _ => MemoryKind::Episodic,
                 };
 
-                let embedding: Vec<f32> = embedding_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
+                let embedding = bytes_to_embedding(&embedding_bytes);
 
                 let metadata: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&metadata_json).unwrap_or_default();
@@ -491,10 +493,7 @@ impl Repository {
                     _ => MemoryKind::Episodic,
                 };
 
-                let embedding: Vec<f32> = embedding_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
+                let embedding = bytes_to_embedding(&embedding_bytes);
 
                 let metadata: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&metadata_json).unwrap_or_default();
@@ -598,10 +597,7 @@ impl Repository {
                     _ => MemoryKind::Episodic,
                 };
 
-                let embedding: Vec<f32> = embedding_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
+                let embedding = bytes_to_embedding(&embedding_bytes);
 
                 let metadata: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&metadata_json).unwrap_or_default();

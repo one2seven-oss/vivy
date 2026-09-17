@@ -14,7 +14,7 @@
 //! Selectivity estimation (<30% → push predicate into traversal, >30% →
 //! post-filter) lives in concurrent.rs.
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use std::collections::HashMap;
 
 // Filter expression AST. Evaluated bottom-up: children first, then combine bitmaps.
@@ -27,10 +27,10 @@ pub enum FilterExpr {
     Not(Box<FilterExpr>),
 }
 
-// index[field][value] → RoaringBitmap. Wrapped in RwLock inside VivyIndex.
+// index[field][value] → RoaringTreemap. Wrapped in RwLock inside VivyIndex.
 #[derive(Clone)]
 pub struct FilterIndex {
-    index: HashMap<String, HashMap<String, RoaringBitmap>>,
+    index: HashMap<String, HashMap<String, RoaringTreemap>>,
 }
 
 impl FilterIndex {
@@ -46,11 +46,11 @@ impl FilterIndex {
         field_map
             .entry(value.to_string())
             .or_default()
-            .insert(id as u32);
+            .insert(id);
     }
 
     // Evaluate the expression tree bottom-up.
-    pub fn evaluate(&self, expr: &FilterExpr) -> RoaringBitmap {
+    pub fn evaluate(&self, expr: &FilterExpr) -> RoaringTreemap {
         match expr {
             FilterExpr::Equals { field, value } => self
                 .index
@@ -59,7 +59,7 @@ impl FilterIndex {
                 .cloned()
                 .unwrap_or_default(),
             FilterExpr::In { field, values } => {
-                let mut result = RoaringBitmap::new();
+                let mut result = RoaringTreemap::new();
                 if let Some(field_map) = self.index.get(field) {
                     for v in values {
                         if let Some(bitmap) = field_map.get(v) {
@@ -73,12 +73,12 @@ impl FilterIndex {
                 let mut iter = exprs.iter().map(|e| self.evaluate(e));
                 let first = match iter.next() {
                     Some(b) => b,
-                    None => return RoaringBitmap::new(),
+                    None => return RoaringTreemap::new(),
                 };
                 iter.fold(first, |acc, b| acc & b)
             }
             FilterExpr::Or(exprs) => {
-                let mut result = RoaringBitmap::new();
+                let mut result = RoaringTreemap::new();
                 for e in exprs {
                     result |= self.evaluate(e);
                 }
@@ -102,8 +102,8 @@ impl FilterIndex {
     }
 
     // Union of all per-value bitmaps. Used by Not expressions
-    fn all_ids(&self) -> RoaringBitmap {
-        let mut all = RoaringBitmap::new();
+    fn all_ids(&self) -> RoaringTreemap {
+        let mut all = RoaringTreemap::new();
         for field_map in self.index.values() {
             for bitmap in field_map.values() {
                 all |= bitmap;
@@ -113,7 +113,7 @@ impl FilterIndex {
     }
 
     fn total_ids(&self) -> u64 {
-        let mut all = RoaringBitmap::new();
+        let mut all = RoaringTreemap::new();
         for field_map in self.index.values() {
             for bitmap in field_map.values() {
                 all |= bitmap;
@@ -132,7 +132,7 @@ impl Default for FilterIndex {
 // Check a single ID against a filter. Useful for sealed-segment post-filtering
 pub fn passes_filter(filter_index: &FilterIndex, expr: &FilterExpr, id: u64) -> bool {
     let bitmap = filter_index.evaluate(expr);
-    bitmap.contains(id as u32)
+    bitmap.contains(id)
 }
 
 #[cfg(test)]

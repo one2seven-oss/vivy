@@ -60,6 +60,19 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Truncate WAL to 0 bytes after delta segments are compacted.
+    pub fn reset(&mut self) -> Result<(), WalError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .read(true)
+            .open(&self.path)?;
+        self.file = BufWriter::new(file);
+        self.committed = 0;
+        Ok(())
+    }
+
     /// Replay all entries from the WAL, calling `f` for each.
     pub fn replay(path: impl AsRef<Path>, mut f: impl FnMut(WalEntry)) -> Result<(), WalError> {
         let file = match File::open(path.as_ref()) {

@@ -305,7 +305,7 @@ mod tests {
             source: HashMap::new(),
         };
 
-        let records = vec![rec];
+        let records = [rec];
         index.rebuild(Box::new(records.iter())).unwrap();
         let results_rebuilt = index.search(&q, 2).unwrap();
         assert_eq!(results_rebuilt.len(), 1);
