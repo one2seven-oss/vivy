@@ -13,9 +13,23 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::error::VivyError;
+
+pub const NUM_SHARDS: usize = 8;
+
+#[inline]
+fn shard_idx(id: u64, num_shards: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    (hasher.finish() as usize) % num_shards
+}
+
 /// Thread-safe vector index (mutable delta segment + atomically-swappable sealed list)
 pub struct VivyIndex {
-    pub(crate) delta: Arc<RwLock<HnswIndex>>,
+    dims: usize,
+    pub(crate) shards: Arc<Vec<RwLock<HnswIndex>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     pub(crate) filter_index: RwLock<FilterIndex>,
     wal: Option<Mutex<WalWriter>>,
@@ -27,6 +41,7 @@ pub struct VivyIndex {
 
 impl VivyIndex {
     pub fn new(
+        dims: usize,
         metric: Metric,
         wal_path: Option<impl AsRef<Path>>,
         data_dir: Option<impl AsRef<Path>>,
@@ -41,8 +56,14 @@ impl VivyIndex {
         let sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>> =
             Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
+        let shards = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(HnswIndex::new(dims, metric)))
+            .collect::<Vec<_>>();
+        let shards = Arc::new(shards);
+
         let mut idx = Self {
-            delta: Arc::new(RwLock::new(HnswIndex::new(metric))),
+            dims,
+            shards: shards.clone(),
             sealed: sealed.clone(),
             filter_index: RwLock::new(FilterIndex::new()),
             wal,
@@ -53,14 +74,13 @@ impl VivyIndex {
         };
 
         let running = idx.running.clone();
-        let delta = idx.delta.clone();
         let sealed = idx.sealed.clone();
         let dir = idx.data_dir.clone();
         let m = metric;
 
         let h = thread::Builder::new()
             .name("vivy-compactor".into())
-            .spawn(move || compactor_loop(running, delta, sealed, dir, m))
+            .spawn(move || compactor_loop(running, dims, shards, sealed, dir, m))
             .expect("compactor thread");
         idx.handle = Some(h);
 
@@ -68,7 +88,10 @@ impl VivyIndex {
     }
 
     /// Insert with auto-generated ID
-    pub fn insert(&self, vector: Vec<f32>) -> Result<u64, WalError> {
+    pub fn insert(&self, vector: Vec<f32>) -> Result<u64, VivyError> {
+        if vector.len() != self.dims {
+            return Err(VivyError::DimensionMismatch);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref wal_mutex) = self.wal {
@@ -80,12 +103,16 @@ impl VivyIndex {
             wal.commit()?;
         }
 
-        self.delta.write().insert(id, vector);
+        let shard = shard_idx(id, NUM_SHARDS);
+        self.shards[shard].write().insert(id, vector);
         Ok(id)
     }
 
     /// Insert with explicit ID
-    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), WalError> {
+    pub fn insert_with_id(&self, id: u64, vector: Vec<f32>) -> Result<(), VivyError> {
+        if vector.len() != self.dims {
+            return Err(VivyError::DimensionMismatch);
+        }
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
             wal.append(&WalEntry::Insert {
@@ -94,7 +121,8 @@ impl VivyIndex {
             })?;
             wal.commit()?;
         }
-        self.delta.write().insert(id, vector);
+        let shard = shard_idx(id, NUM_SHARDS);
+        self.shards[shard].write().insert(id, vector);
         Ok(())
     }
 
@@ -103,7 +131,10 @@ impl VivyIndex {
         &self,
         vector: Vec<f32>,
         metadata: Vec<(String, String)>,
-    ) -> Result<u64, WalError> {
+    ) -> Result<u64, VivyError> {
+        if vector.len() != self.dims {
+            return Err(VivyError::DimensionMismatch);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref wal_mutex) = self.wal {
@@ -122,8 +153,60 @@ impl VivyIndex {
             }
         }
 
-        self.delta.write().insert(id, vector);
+        let shard = shard_idx(id, NUM_SHARDS);
+        self.shards[shard].write().insert(id, vector);
         Ok(id)
+    }
+
+    /// Batch insert with auto-generated IDs
+    pub fn insert_batch(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<u64>, VivyError> {
+        self.insert_batch_with_metadata(vectors, None)
+    }
+
+    /// Batch insert with metadata fields
+    pub fn insert_batch_with_metadata(
+        &self,
+        vectors: Vec<Vec<f32>>,
+        metadata: Option<Vec<Vec<(String, String)>>>,
+    ) -> Result<Vec<u64>, VivyError> {
+        let mut ids = Vec::with_capacity(vectors.len());
+        for _ in 0..vectors.len() {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            ids.push(id);
+        }
+
+        for v in &vectors {
+            if v.len() != self.dims {
+                return Err(VivyError::DimensionMismatch);
+            }
+        }
+
+        if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            for (id, vector) in ids.iter().zip(vectors.iter()) {
+                wal.append(&WalEntry::Insert {
+                    id: *id,
+                    vector: vector.clone(),
+                })?;
+            }
+            wal.commit()?;
+        }
+
+        if let Some(ref metas) = metadata {
+            let mut fi = self.filter_index.write();
+            for (id, meta) in ids.iter().zip(metas.iter()) {
+                for (field, value) in meta {
+                    fi.insert(*id, field, value);
+                }
+            }
+        }
+
+        for (id, vector) in ids.iter().zip(vectors.into_iter()) {
+            let shard = shard_idx(*id, NUM_SHARDS);
+            self.shards[shard].write().insert(*id, vector);
+        }
+
+        Ok(ids)
     }
 
     /// Search with an optional filter expression
@@ -132,7 +215,10 @@ impl VivyIndex {
         query: &[f32],
         k: usize,
         filter: Option<&FilterExpr>,
-    ) -> Vec<(u64, f32)> {
+    ) -> Result<Vec<(u64, f32)>, VivyError> {
+        if query.len() != self.dims {
+            return Err(VivyError::DimensionMismatch);
+        }
         let (filter_bitmap, has_filter) = match filter {
             Some(expr) => {
                 let fi = self.filter_index.read();
@@ -145,28 +231,33 @@ impl VivyIndex {
 
         // If a filter was provided but no items match, return empty
         if has_filter && filter_bitmap.is_none() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let (mut results, metric) = {
-            let guard = self.delta.read();
-            (guard.search_filtered(query, k, filter_bitmap.as_ref()), guard.metric())
+            let mut results = Vec::new();
+            let metric = self.shards[0].read().metric();
+            for shard in self.shards.iter() {
+                let shard_results = shard.read().search_filtered(query, k, filter_bitmap.as_ref());
+                results.extend(shard_results);
+            }
+            (results, metric)
         };
 
         // Search sealed segments
         let sealed_list = self.sealed.load();
         for seg in sealed_list.iter() {
             for idx in 0..seg.num_nodes() {
-                if let Ok(rec) = seg.read_node(idx) {
+                if let Ok(id) = seg.id_at(idx) {
                     let passes_filter = filter_bitmap
                         .as_ref()
-                        .is_none_or(|bm| bm.contains(rec.id as u32));
+                        .is_none_or(|bm| bm.contains(id as u32));
                     if !passes_filter {
                         continue;
                     }
-                    if let Some(ref v) = rec.vector {
+                    if let Ok(v) = seg.vector_at(idx) {
                         let d = distance::compute(metric, query, v);
-                        results.push((rec.id, d));
+                        results.push((id, d));
                     }
                 }
             }
@@ -174,23 +265,31 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
-        results
+        Ok(results)
     }
 
     /// Search across delta + all sealed segments.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u64, f32)>, VivyError> {
+        if query.len() != self.dims {
+            return Err(VivyError::DimensionMismatch);
+        }
         let (mut results, metric) = {
-            let guard = self.delta.read();
-            (guard.search(query, k), guard.metric())
+            let mut results = Vec::new();
+            let metric = self.shards[0].read().metric();
+            for shard in self.shards.iter() {
+                let shard_results = shard.read().search(query, k);
+                results.extend(shard_results);
+            }
+            (results, metric)
         };
 
         let sealed_list = self.sealed.load();
         for seg in sealed_list.iter() {
             for idx in 0..seg.num_nodes() {
-                if let Ok(rec) = seg.read_node(idx) {
-                    if let Some(ref v) = rec.vector {
+                if let Ok(id) = seg.id_at(idx) {
+                    if let Ok(v) = seg.vector_at(idx) {
                         let d = distance::compute(metric, query, v);
-                        results.push((rec.id, d));
+                        results.push((id, d));
                     }
                 }
             }
@@ -198,11 +297,11 @@ impl VivyIndex {
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         results.truncate(k);
-        results
+        Ok(results)
     }
 
     pub fn delta_len(&self) -> usize {
-        self.delta.read().len()
+        self.shards.iter().map(|s| s.read().len()).sum()
     }
 
     pub fn num_sealed(&self) -> usize {
@@ -212,8 +311,8 @@ impl VivyIndex {
     /// Force immediate compaction.
     pub fn compact_now(&self) {
         if let Some(ref dir) = self.data_dir {
-            let m = self.delta.read().metric();
-            if let Err(e) = run_compaction(&self.delta, &self.sealed, dir, m) {
+            let m = self.shards[0].read().metric();
+            if let Err(e) = run_compaction(self.dims, &self.shards, &self.sealed, dir, m) {
                 warn!("compaction failed: {e}");
             }
         }
@@ -231,7 +330,8 @@ impl Drop for VivyIndex {
 
 fn compactor_loop(
     running: Arc<AtomicBool>,
-    delta: Arc<RwLock<HnswIndex>>,
+    dims: usize,
+    shards: Arc<Vec<RwLock<HnswIndex>>>,
     sealed: Arc<ArcSwap<Vec<Arc<SealedSegment>>>>,
     data_dir: Option<PathBuf>,
     metric: Metric,
@@ -239,9 +339,10 @@ fn compactor_loop(
     let threshold = 10_000usize;
     while running.load(Ordering::Acquire) {
         thread::sleep(Duration::from_secs(5));
-        if delta.read().len() >= threshold {
+        let total_len: usize = shards.iter().map(|s| s.read().len()).sum();
+        if total_len >= threshold {
             if let Some(ref dir) = data_dir {
-                if let Err(e) = run_compaction(&delta, &sealed, dir, metric) {
+                if let Err(e) = run_compaction(dims, &shards, &sealed, dir, metric) {
                     warn!("compaction failed: {e}");
                 }
             }
@@ -250,32 +351,33 @@ fn compactor_loop(
 }
 
 fn run_compaction(
-    delta: &RwLock<HnswIndex>,
+    dims: usize,
+    shards: &[RwLock<HnswIndex>],
     sealed: &ArcSwap<Vec<Arc<SealedSegment>>>,
     data_dir: &Path,
     metric: Metric,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut old = {
-        let mut guard = delta.write();
-        let fresh = HnswIndex::new(metric);
-        std::mem::replace(&mut *guard, fresh)
-    };
-
-    let entries = old.drain();
+    let mut entries = Vec::new();
+    for shard in shards {
+        let mut old = {
+            let mut guard = shard.write();
+            let fresh = HnswIndex::new(dims, metric);
+            std::mem::replace(&mut *guard, fresh)
+        };
+        entries.extend(old.drain());
+    }
     if entries.is_empty() {
         return Ok(());
     }
     info!("compacting {} vectors into sealed segment", entries.len());
 
-    let dims = entries[0].1.len() as u32;
-
     let seg_path = data_dir.join(format!("seg-{}.vivy", timestamp_ns()));
     let file = std::fs::File::create(&seg_path)?;
     let writer = BufWriter::new(file.try_clone()?);
 
-    let mut seg_writer = SegmentWriter::new(writer, dims, 16, 32);
+    let mut seg_writer = SegmentWriter::new(writer, dims as u32, 16, 32);
     for (id, vector) in &entries {
-        seg_writer.push(*id, 0, vec![Vec::new()], vector.clone());
+        seg_writer.push(*id, 0, vec![Vec::new()], vector.clone())?;
     }
     seg_writer.write()?;
     drop(file);
@@ -316,11 +418,11 @@ mod tests {
         let data = dir.path().join("segments");
         std::fs::create_dir_all(&data).unwrap();
 
-        let idx = VivyIndex::new(Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
         idx.insert(vec![1.0, 0.0, 0.0]).unwrap();
         idx.insert(vec![0.0, 1.0, 0.0]).unwrap();
 
-        let res = idx.search(&[1.0, 0.0, 0.0], 1);
+        let res = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
         assert!(!res.is_empty());
         drop(idx);
     }
@@ -332,7 +434,7 @@ mod tests {
         let data = dir.path().join("segments");
         std::fs::create_dir_all(&data).unwrap();
 
-        let idx = VivyIndex::new(Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
         for i in 0..5 {
             idx.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
@@ -341,8 +443,26 @@ mod tests {
         assert_eq!(idx.delta_len(), 0);
         assert_eq!(idx.num_sealed(), 1);
 
-        let res = idx.search(&[3.0, 0.0, 0.0], 1);
+        let res = idx.search(&[3.0, 0.0, 0.0], 1).unwrap();
         assert!(!res.is_empty());
         drop(idx);
+    }
+
+    #[test]
+    fn test_512_dim() {
+        let dir = tempdir().unwrap();
+        let wal = dir.path().join("test.wal");
+        let data = dir.path().join("segments");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let idx = VivyIndex::new(512, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let v1 = vec![1.0; 512];
+        let v2 = vec![0.0; 512];
+
+        idx.insert(v1.clone()).unwrap();
+        idx.insert(v2.clone()).unwrap();
+
+        let res = idx.search(&v1, 1).unwrap();
+        assert_eq!(res[0].0, 1);
     }
 }

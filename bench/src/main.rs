@@ -7,8 +7,13 @@ use vivy_core::flat::FlatIndex;
 
 fn main() {
     println!("Vivy benchmark");
+    println!("=== 64 Dimensions ===");
+    run_benchmark(64);
+    println!("\n=== 512 Dimensions ===");
+    run_benchmark(512);
+}
 
-    let dims = 64;
+fn run_benchmark(dims: usize) {
     let n = 5000;
     let n_queries = 100;
     let k = 10;
@@ -20,7 +25,7 @@ fn main() {
     let t = Instant::now();
     let mut flat = FlatIndex::new(Metric::L2);
     for (i, v) in data.iter().enumerate() {
-        flat.insert(i as u64, v.clone());
+        flat.insert((i + 1) as u64, v.clone());
     }
     let flat_time = t.elapsed();
     println!("  flat build: {flat_time:?}");
@@ -36,7 +41,7 @@ fn main() {
     // HNSW index
     println!("\nBuilding HNSW index...");
     let t = Instant::now();
-    let idx = VivyIndex::new(Metric::L2, None::<&str>, None::<&str>).unwrap();
+    let idx = VivyIndex::new(dims, Metric::L2, None::<&str>, None::<&str>).unwrap();
     for v in &data {
         black_box(idx.insert(black_box(v.clone()))).unwrap();
     }
@@ -48,7 +53,7 @@ fn main() {
 
     // 10 queries
     for q in queries.iter().take(10) {
-        black_box(idx.search(q, k));
+        black_box(idx.search(q, k)).unwrap();
     }
 
     // Recall & latency
@@ -58,7 +63,7 @@ fn main() {
     let mut search_latency = Duration::ZERO;
     for (i, q) in queries.iter().enumerate() {
         let tq = Instant::now();
-        let results = idx.search(q, k);
+        let results = idx.search(q, k).unwrap();
         search_latency += tq.elapsed();
 
         for gt_id in &gt[i] {

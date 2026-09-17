@@ -24,7 +24,8 @@ use std::collections::{BinaryHeap, HashSet};
 #[derive(Clone)]
 pub struct HnswIndex {
     // Vectors + IDs by internal node index (0..len-1).
-    vectors: Vec<Vec<f32>>,
+    vectors: Vec<f32>,
+    dims: usize,
     ids: Vec<u64>,
 
     // neighbors[node][layer] = neighbour indices.
@@ -64,11 +65,12 @@ impl PartialOrd for Candidate {
 }
 
 impl HnswIndex {
-    pub fn new(metric: Metric) -> Self {
+    pub fn new(dims: usize, metric: Metric) -> Self {
         // Paper defaults: M=16, ef_construction=200, ml=1/ln(M)≈0.36.
         let m = 16;
         Self {
             vectors: Vec::new(),
+            dims,
             ids: Vec::new(),
             neighbors: Vec::new(),
             levels: Vec::new(),
@@ -98,8 +100,8 @@ impl HnswIndex {
     }
 
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
-        let idx = self.vectors.len();
-        self.vectors.push(vector);
+        let idx = self.ids.len();
+        self.vectors.extend(vector);
         self.ids.push(id);
         let level = self.random_level();
         self.levels.push(level);
@@ -114,12 +116,12 @@ impl HnswIndex {
         // Greedy descent from top to one above node's level — we only need
         // the single closest node to locate the insertion neighbourhood.
         for lc in (level + 1..=self.max_level).rev() {
-            ep = self.greedy_down(&self.vectors[idx], ep, lc);
+            ep = self.greedy_down(&self.vectors[idx * self.dims..(idx + 1) * self.dims], ep, lc);
         }
 
         // Insert at each layer: ef_search → select closest → connect bidirectionally → trim overflow.
         for lc in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.ef_search(&self.vectors[idx], ep, self.ef_construction, lc);
+            let candidates = self.ef_search(&self.vectors[idx * self.dims..(idx + 1) * self.dims], ep, self.ef_construction, lc);
             let m_conn = if lc == 0 { self.m_max } else { self.m };
             let selected = closest_n(&candidates, m_conn);
 
@@ -148,8 +150,8 @@ impl HnswIndex {
             let mut improved = false;
             if let Some(neigh) = self.neighbors[ep].get(layer) {
                 for &n in neigh {
-                    let d = distance::compute(self.metric, query, &self.vectors[n]);
-                    if d < distance::compute(self.metric, query, &self.vectors[ep]) {
+                    let d = distance::compute(self.metric, query, &self.vectors[n * self.dims..(n + 1) * self.dims]);
+                    if d < distance::compute(self.metric, query, &self.vectors[ep * self.dims..(ep + 1) * self.dims]) {
                         ep = n;
                         improved = true;
                     }
@@ -170,7 +172,7 @@ impl HnswIndex {
     fn ef_search(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<(usize, f32)> {
         let mut visited = HashSet::new();
         visited.insert(entry);
-        let ed = distance::compute(self.metric, query, &self.vectors[entry]);
+        let ed = distance::compute(self.metric, query, &self.vectors[entry * self.dims..(entry + 1) * self.dims]);
 
         let mut candidates = BinaryHeap::new();
         candidates.push(Candidate {
@@ -192,7 +194,7 @@ impl HnswIndex {
             if let Some(neigh) = self.neighbors[c.idx].get(layer) {
                 for &n in neigh {
                     if visited.insert(n) {
-                        let d = distance::compute(self.metric, query, &self.vectors[n]);
+                        let d = distance::compute(self.metric, query, &self.vectors[n * self.dims..(n + 1) * self.dims]);
                         let of = OrderedFloat(d);
                         let furthest = results.peek().unwrap().dist;
                         if of < furthest || results.len() < ef {
@@ -222,7 +224,7 @@ impl HnswIndex {
             .map(|&n| {
                 (
                     n,
-                    distance::compute(self.metric, &self.vectors[node], &self.vectors[n]),
+                    distance::compute(self.metric, &self.vectors[node * self.dims..(node + 1) * self.dims], &self.vectors[n * self.dims..(n + 1) * self.dims]),
                 )
             })
             .collect();
@@ -239,13 +241,20 @@ impl HnswIndex {
         self.ids
             .iter()
             .copied()
-            .zip(self.vectors.iter().cloned())
+            .enumerate()
+            .map(|(idx, id)| {
+                let start = idx * self.dims;
+                let end = start + self.dims;
+                (id, self.vectors[start..end].to_vec())
+            })
             .collect()
     }
 
     // Drains the index to empty. Used by the compactor to move delta entries to sealed segments.
     pub fn drain(&mut self) -> Vec<(u64, Vec<f32>)> {
-        let data: Vec<_> = self.ids.drain(..).zip(self.vectors.drain(..)).collect();
+        let data = self.snapshot();
+        self.vectors.clear();
+        self.ids.clear();
         self.neighbors.clear();
         self.levels.clear();
         self.entry = None;
@@ -316,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_hnsw_insert_search() {
-        let mut idx = HnswIndex::new(Metric::L2);
+        let mut idx = HnswIndex::new(3, Metric::L2);
         idx.insert(0, vec![1.0, 0.0, 0.0]);
         idx.insert(1, vec![0.0, 1.0, 0.0]);
         idx.insert(2, vec![0.0, 0.0, 1.0]);
@@ -327,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_hnsw_empty() {
-        let idx = HnswIndex::new(Metric::L2);
+        let idx = HnswIndex::new(2, Metric::L2);
         let res = idx.search(&[1.0, 0.0], 5);
         assert!(res.is_empty());
     }
@@ -335,7 +344,7 @@ mod tests {
     // 100 collinear points at x=0..100, search at x=50, expect 50 as top result.
     #[test]
     fn test_hnsw_multiple() {
-        let mut idx = HnswIndex::new(Metric::L2);
+        let mut idx = HnswIndex::new(2, Metric::L2);
         for i in 0..100 {
             let v = vec![i as f32, 0.0];
             idx.insert(i as u64, v);

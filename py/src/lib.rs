@@ -27,14 +27,14 @@ struct Index {
 #[pymethods]
 impl Index {
     #[new]
-    fn new(_dims: usize, metric: &str) -> PyResult<Self> {
+    fn new(dims: usize, metric: &str) -> PyResult<Self> {
         let m = match metric {
             "l2" | "L2" => Metric::L2,
             "cosine" | "Cosine" => Metric::Cosine,
             "dot" | "Dot" => Metric::Dot,
             other => return Err(PyValueError::new_err(format!("unknown metric: {other}"))),
         };
-        let inner = VivyIndex::new(m, Option::<&str>::None, Option::<&str>::None)
+        let inner = VivyIndex::new(dims, m, Option::<&str>::None, Option::<&str>::None)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
@@ -44,6 +44,34 @@ impl Index {
         let meta = parse_metadata(metadata)?;
         py.allow_threads(move || {
             self.inner.insert_with_metadata(vector, meta)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (vectors, metadata=None))]
+    fn insert_batch(
+        &self,
+        py: Python<'_>,
+        vectors: Vec<Vec<f32>>,
+        metadata: Option<Vec<Option<Bound<'_, PyDict>>>>,
+    ) -> PyResult<Vec<u64>> {
+        let metas = match metadata {
+            Some(list) => {
+                let mut parsed = Vec::with_capacity(list.len());
+                for item in list {
+                    let m = match item {
+                        Some(ref d) => parse_metadata(Some(d))?,
+                        None => Vec::new(),
+                    };
+                    parsed.push(m);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+
+        py.allow_threads(move || {
+            self.inner.insert_batch_with_metadata(vectors, metas)
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })
     }
@@ -59,7 +87,8 @@ impl Index {
         let expr = parse_filter(filter)?;
         let results = py.allow_threads(move || {
             self.inner.search_filtered(&query, k, expr.as_ref())
-        });
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
         Ok(results)
     }
 
@@ -87,8 +116,13 @@ fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>
     let mut exprs = Vec::new();
     for (key, val) in d.iter() {
         let field: String = key.extract()?;
-        let value: String = val.extract()?;
-        exprs.push(FilterExpr::Equals { field, value });
+        if let Ok(value) = val.extract::<String>() {
+            exprs.push(FilterExpr::Equals { field, value });
+        } else if let Ok(values) = val.extract::<Vec<String>>() {
+            exprs.push(FilterExpr::In { field, values });
+        } else {
+            return Err(PyValueError::new_err("filter values must be a string or a list of strings"));
+        }
     }
     if exprs.is_empty() {
         return Ok(None);

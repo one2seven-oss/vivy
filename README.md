@@ -33,7 +33,6 @@ you outgrow a single machine.
 ### What it does
 
 - **HNSW graph** index with configurable M and ef_construction
-- **Product quantization** for tight memory budgets
 - **Metadata filtering** with Roaring bitmap indices (AND, OR, NOT, IN)
 - **Crash-safe WAL** on a background fsync thread
 - **Non-blocking inserts** — search never waits on a write lock

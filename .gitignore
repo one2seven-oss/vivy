@@ -2,9 +2,11 @@
 *.pyc
 __pycache__/
 *.egg-info/
+doc/
 *.so
 .venv/
 venv/
 .DS_Store
 *.o
 guidedoc/
+Cargo.lock

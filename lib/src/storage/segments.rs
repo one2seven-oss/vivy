@@ -30,6 +30,8 @@ pub enum SegmentError {
     Io(#[from] std::io::Error),
     #[error("file too small")]
     Truncated,
+    #[error("dimension mismatch")]
+    DimensionMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +208,44 @@ impl SealedSegment {
         }
         Ok(&buf[pos..pos + self.pq_subvectors])
     }
+
+    pub fn id_at(&self, idx: usize) -> Result<u64, SegmentError> {
+        let start = self.offset_of(idx)?;
+        if start + 8 > self.mmap.len() {
+            return Err(SegmentError::Truncated);
+        }
+        let id = u64::from_le_bytes(self.mmap[start..start + 8].try_into().unwrap());
+        Ok(id)
+    }
+
+    pub fn vector_at(&self, idx: usize) -> Result<&[f32], SegmentError> {
+        let start = self.offset_of(idx)?;
+        let buf = &self.mmap[start..];
+        if buf.len() < 12 {
+            return Err(SegmentError::Truncated);
+        }
+        let level = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut pos = 12usize;
+        for _ in 0..=level {
+            if pos + 4 > buf.len() {
+                return Err(SegmentError::Truncated);
+            }
+            let n_neigh = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + n_neigh * 4 > buf.len() {
+                return Err(SegmentError::Truncated);
+            }
+            pos += n_neigh * 4;
+        }
+        if self.pq_enabled {
+            return Err(SegmentError::DimensionMismatch);
+        }
+        if pos + self.dims * 4 > buf.len() {
+            return Err(SegmentError::Truncated);
+        }
+        let v: &[f32] = bytemuck::cast_slice(&buf[pos..pos + self.dims * 4]);
+        Ok(v)
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -235,8 +275,12 @@ impl<W: std::io::Write + std::io::Seek> SegmentWriter<W> {
         }
     }
 
-    pub fn push(&mut self, id: u64, level: u32, neighbors: Vec<Vec<u32>>, vector: Vec<f32>) {
+    pub fn push(&mut self, id: u64, level: u32, neighbors: Vec<Vec<u32>>, vector: Vec<f32>) -> Result<(), SegmentError> {
+        if vector.len() != self.header.dims as usize {
+            return Err(SegmentError::DimensionMismatch);
+        }
         self.nodes.push((id, level, neighbors, vector));
+        Ok(())
     }
 
     pub fn num_nodes(&self) -> usize {
@@ -294,8 +338,8 @@ mod tests {
         {
             let writer = BufWriter::new(file.try_clone().unwrap());
             let mut seg_w = SegmentWriter::new(writer, 4, 16, 32);
-            seg_w.push(42, 1, vec![vec![1, 2], vec![3]], vec![1.0, 2.0, 3.0, 4.0]);
-            seg_w.push(7, 0, vec![vec![0]], vec![5.0, 6.0, 7.0, 8.0]);
+            seg_w.push(42, 1, vec![vec![1, 2], vec![3]], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+            seg_w.push(7, 0, vec![vec![0]], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
             seg_w.write().unwrap();
         }
         file.seek(SeekFrom::Start(0)).unwrap();

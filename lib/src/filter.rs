@@ -101,7 +101,7 @@ impl FilterIndex {
         self.evaluate(expr).len() as f64 / total
     }
 
-    // Union of all per-value bitmaps. Used by Not expressions.
+    // Union of all per-value bitmaps. Used by Not expressions
     fn all_ids(&self) -> RoaringBitmap {
         let mut all = RoaringBitmap::new();
         for field_map in self.index.values() {
@@ -129,7 +129,7 @@ impl Default for FilterIndex {
     }
 }
 
-// Check a single ID against a filter. Useful for sealed-segment post-filtering.
+// Check a single ID against a filter. Useful for sealed-segment post-filtering
 pub fn passes_filter(filter_index: &FilterIndex, expr: &FilterExpr, id: u64) -> bool {
     let bitmap = filter_index.evaluate(expr);
     bitmap.contains(id as u32)
@@ -157,7 +157,7 @@ mod tests {
         assert!(!result.contains(2));
     }
 
-    // AND filter: only ID 1 matches both color="red" and size="large".
+    // AND filter: only ID 1 matches both color="red" and size="large"
     #[test]
     fn test_filter_and() {
         let mut fi = FilterIndex::new();
@@ -182,7 +182,7 @@ mod tests {
         assert!(result.contains(1));
     }
 
-    // 100 vectors split even/odd → selectivity("even") = 0.5.
+    // 100 vectors split even/odd → selectivity("even") = 0.5
     #[test]
     fn test_selectivity() {
         let mut fi = FilterIndex::new();

@@ -10,6 +10,9 @@ pub enum VivyError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Dimension mismatch")]
+    DimensionMismatch,
 }
 
 pub type VivyResult<T> = Result<T, VivyError>;
