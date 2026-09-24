@@ -252,14 +252,14 @@ impl HnswIndex {
 
     // Drains the index to empty. Used by the compactor to move delta entries to sealed segments.
     pub fn drain(&mut self) -> Vec<(u64, Vec<f32>)> {
-        let data = self.snapshot();
+        let snapshot = self.snapshot();
         self.vectors.clear();
         self.ids.clear();
         self.neighbors.clear();
         self.levels.clear();
         self.entry = None;
         self.max_level = 0;
-        data
+        snapshot
     }
 
     // Unfiltered search — delegates to search_filtered with no filter.
@@ -329,16 +329,16 @@ mod tests {
         idx.insert(0, vec![1.0, 0.0, 0.0]);
         idx.insert(1, vec![0.0, 1.0, 0.0]);
         idx.insert(2, vec![0.0, 0.0, 1.0]);
-        let res = idx.search(&[1.0, 0.0, 0.0], 1);
-        assert!(!res.is_empty());
-        assert_eq!(res[0].0, 0);
+        let hits = idx.search(&[1.0, 0.0, 0.0], 1);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 0);
     }
 
     #[test]
     fn test_hnsw_empty() {
         let idx = HnswIndex::new(2, Metric::L2);
-        let res = idx.search(&[1.0, 0.0], 5);
-        assert!(res.is_empty());
+        let hits = idx.search(&[1.0, 0.0], 5);
+        assert!(hits.is_empty());
     }
 
     // 100 collinear points at x=0..100, search at x=50, expect 50 as top result.
@@ -349,8 +349,8 @@ mod tests {
             let v = vec![i as f32, 0.0];
             idx.insert(i as u64, v);
         }
-        let res = idx.search(&[50.0, 0.0], 5);
-        assert_eq!(res.len(), 5);
-        assert_eq!(res[0].0, 50);
+        let hits = idx.search(&[50.0, 0.0], 5);
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0].0, 50);
     }
 }

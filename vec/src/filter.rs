@@ -59,15 +59,15 @@ impl FilterIndex {
                 .cloned()
                 .unwrap_or_default(),
             FilterExpr::In { field, values } => {
-                let mut result = RoaringTreemap::new();
+                let mut matched = RoaringTreemap::new();
                 if let Some(field_map) = self.index.get(field) {
                     for v in values {
                         if let Some(bitmap) = field_map.get(v) {
-                            result |= bitmap;
+                            matched |= bitmap;
                         }
                     }
                 }
-                result
+                matched
             }
             FilterExpr::And(exprs) => {
                 let mut iter = exprs.iter().map(|e| self.evaluate(e));
@@ -78,11 +78,11 @@ impl FilterIndex {
                 iter.fold(first, |acc, b| acc & b)
             }
             FilterExpr::Or(exprs) => {
-                let mut result = RoaringTreemap::new();
+                let mut matched = RoaringTreemap::new();
                 for e in exprs {
-                    result |= self.evaluate(e);
+                    matched |= self.evaluate(e);
                 }
-                result
+                matched
             }
             FilterExpr::Not(expr) => {
                 let all = self.all_ids();
@@ -113,13 +113,7 @@ impl FilterIndex {
     }
 
     fn total_ids(&self) -> u64 {
-        let mut all = RoaringTreemap::new();
-        for field_map in self.index.values() {
-            for bitmap in field_map.values() {
-                all |= bitmap;
-            }
-        }
-        all.len()
+        self.all_ids().len()
     }
 }
 
@@ -151,13 +145,12 @@ mod tests {
             field: "color".into(),
             value: "red".into(),
         };
-        let result = fi.evaluate(&expr);
-        assert!(result.contains(1));
-        assert!(result.contains(3));
-        assert!(!result.contains(2));
+        let matched = fi.evaluate(&expr);
+        assert!(matched.contains(1));
+        assert!(matched.contains(3));
+        assert!(!matched.contains(2));
     }
 
-    // AND filter: only ID 1 matches both color="red" and size="large"
     #[test]
     fn test_filter_and() {
         let mut fi = FilterIndex::new();
@@ -177,9 +170,9 @@ mod tests {
                 value: "large".into(),
             },
         ]);
-        let result = fi.evaluate(&expr);
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(1));
+        let matched = fi.evaluate(&expr);
+        assert_eq!(matched.len(), 1);
+        assert!(matched.contains(1));
     }
 
     // 100 vectors split even/odd → selectivity("even") = 0.5

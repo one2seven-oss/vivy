@@ -133,10 +133,7 @@ fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>
     }
 }
 
-// ---------------------------------------------------------------------------
 // Python facade for vivy_memory::MemoryStore
-// ---------------------------------------------------------------------------
-
 #[pyclass(name = "MemoryStore")]
 struct PyMemoryStore {
     inner: std::sync::Arc<vivy_memory::MemoryStore>,
@@ -221,13 +218,14 @@ impl PyMemoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (tenant_id, namespace, query_embedding, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None))]
+    #[pyo3(signature = (tenant_id, namespace, query_embedding, query_text=None, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None))]
     fn recall(
         &self,
         py: Python<'_>,
         tenant_id: &str,
         namespace: &str,
         query_embedding: Vec<f32>,
+        query_text: Option<String>,
         limit: usize,
         agent_id: Option<&str>,
         user_id: Option<&str>,
@@ -246,6 +244,7 @@ impl PyMemoryStore {
         let req = vivy_memory::RecallRequest {
             scope,
             query_embedding,
+            query_text,
             limit,
             filters: vivy_memory::MemoryFilter::default(),
             include_explanations,

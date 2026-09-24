@@ -68,8 +68,8 @@ mod tests {
         idx.insert(0, vec![1.0, 0.0]);
         idx.insert(1, vec![10.0, 0.0]);
 
-        let res = idx.search(&[0.0, 0.0], 2);
-        assert_eq!(res.len(), 2);
-        assert_eq!(res[0].0, 0);
+        let hits = idx.search(&[0.0, 0.0], 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 0);
     }
 }

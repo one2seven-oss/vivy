@@ -54,7 +54,7 @@ impl VivyIndex {
 
         let mut next_id = 1u64;
 
-        // 1. Replay uncompacted WAL entries if existing WAL is present
+        //  Replay uncompacted WAL entries if existing WAL is present
         if let Some(ref path) = wal_path {
             WalWriter::replay(path.as_ref(), |entry| match entry {
                 WalEntry::Insert { id, vector } => {
@@ -74,7 +74,7 @@ impl VivyIndex {
             .map(|w| Arc::new(Mutex::new(w)));
         let data_dir = data_dir.map(|p| p.as_ref().to_path_buf());
 
-        // 2. Discover existing sealed segments in data directory using manifest
+        //  Discover existing sealed segments in data directory using manifest
         let mut initial_sealed = Vec::new();
         if let Some(ref dir) = data_dir {
             if dir.exists() {
@@ -498,15 +498,15 @@ mod tests {
     fn test_basic_insert_search() {
         let dir = tempdir().unwrap();
         let wal = dir.path().join("test.wal");
-        let data = dir.path().join("segments");
-        std::fs::create_dir_all(&data).unwrap();
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).unwrap();
 
-        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
         idx.insert(vec![1.0, 0.0, 0.0]).unwrap();
         idx.insert(vec![0.0, 1.0, 0.0]).unwrap();
 
-        let res = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
-        assert!(!res.is_empty());
+        let hits = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert!(!hits.is_empty());
         drop(idx);
     }
 
@@ -514,10 +514,10 @@ mod tests {
     fn test_compaction() {
         let dir = tempdir().unwrap();
         let wal = dir.path().join("test.wal");
-        let data = dir.path().join("segments");
-        std::fs::create_dir_all(&data).unwrap();
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).unwrap();
 
-        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
         for i in 0..5 {
             idx.insert(vec![i as f32, 0.0, 0.0]).unwrap();
         }
@@ -526,8 +526,8 @@ mod tests {
         assert_eq!(idx.delta_len(), 0);
         assert_eq!(idx.num_sealed(), 1);
 
-        let res = idx.search(&[3.0, 0.0, 0.0], 1).unwrap();
-        assert!(!res.is_empty());
+        let hits = idx.search(&[3.0, 0.0, 0.0], 1).unwrap();
+        assert!(!hits.is_empty());
         drop(idx);
     }
 
@@ -535,47 +535,45 @@ mod tests {
     fn test_512_dim() {
         let dir = tempdir().unwrap();
         let wal = dir.path().join("test.wal");
-        let data = dir.path().join("segments");
-        std::fs::create_dir_all(&data).unwrap();
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).unwrap();
 
-        let idx = VivyIndex::new(512, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(512, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
         let v1 = vec![1.0; 512];
         let v2 = vec![0.0; 512];
 
         idx.insert(v1.clone()).unwrap();
         idx.insert(v2.clone()).unwrap();
 
-        let res = idx.search(&v1, 1).unwrap();
-        assert_eq!(res[0].0, 1);
+        let hits = idx.search(&v1, 1).unwrap();
+        assert_eq!(hits[0].0, 1);
     }
 
     #[test]
     fn test_64bit_id_preservation_and_filtering() {
         let dir = tempdir().unwrap();
         let wal = dir.path().join("test.wal");
-        let data = dir.path().join("segments");
-        std::fs::create_dir_all(&data).unwrap();
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).unwrap();
 
-        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
         let large_id_1 = (1u64 << 40) + 123;
         let large_id_2 = u64::MAX - 99;
 
         idx.insert_with_id(large_id_1, vec![1.0, 0.0, 0.0]).unwrap();
         idx.insert_with_id(large_id_2, vec![0.0, 1.0, 0.0]).unwrap();
 
-        // Check search returns exact 64-bit IDs without truncation
-        let res = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(res[0].0, large_id_1);
+        let matches1 = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(matches1[0].0, large_id_1);
 
-        let res2 = idx.search(&[0.0, 1.0, 0.0], 1).unwrap();
-        assert_eq!(res2[0].0, large_id_2);
+        let matches2 = idx.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(matches2[0].0, large_id_2);
 
-        // Compact to sealed segment and verify 64-bit IDs in sealed segment
         idx.compact_now();
         assert_eq!(idx.num_sealed(), 1);
 
-        let res_sealed = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(res_sealed[0].0, large_id_1);
+        let sealed_matches = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(sealed_matches[0].0, large_id_1);
     }
 
     #[test]
@@ -593,11 +591,11 @@ mod tests {
     fn test_reopen_wal_and_sealed_recovery() {
         let dir = tempdir().unwrap();
         let wal = dir.path().join("test.wal");
-        let data = dir.path().join("segments");
-        std::fs::create_dir_all(&data).unwrap();
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).unwrap();
 
         {
-            let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+            let idx = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
             idx.insert_with_id(10, vec![1.0, 0.0, 0.0]).unwrap();
             idx.insert_with_id(20, vec![0.0, 1.0, 0.0]).unwrap();
             // Compact 10 & 20 into a sealed segment
@@ -610,19 +608,18 @@ mod tests {
         }
 
         // Reopen index from the same directory & wal
-        let reopened = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&data)).unwrap();
+        let reopened = VivyIndex::new(3, Metric::L2, Some(&wal), Some(&segments_dir)).unwrap();
         assert_eq!(reopened.num_sealed(), 1);
         assert_eq!(reopened.delta_len(), 1);
 
-        // Search for all 3 vectors
-        let res1 = reopened.search(&[1.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(res1[0].0, 10);
+        let match_10 = reopened.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(match_10[0].0, 10);
 
-        let res2 = reopened.search(&[0.0, 1.0, 0.0], 1).unwrap();
-        assert_eq!(res2[0].0, 20);
+        let match_20 = reopened.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(match_20[0].0, 20);
 
-        let res3 = reopened.search(&[0.0, 0.0, 1.0], 1).unwrap();
-        assert_eq!(res3[0].0, 30);
+        let match_30 = reopened.search(&[0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(match_30[0].0, 30);
 
         // Verify high-water mark after reopen
         let next_auto = reopened.insert(vec![0.5, 0.5, 0.0]).unwrap();

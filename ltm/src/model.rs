@@ -202,6 +202,8 @@ impl ForgetRequest {
 pub struct RecallRequest {
     pub scope: MemoryScope,
     pub query_embedding: Vec<f32>,
+    #[serde(default)]
+    pub query_text: Option<String>,
     pub limit: usize,
     pub filters: MemoryFilter,
     pub include_explanations: bool,

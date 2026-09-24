@@ -72,6 +72,7 @@ fn test_recall_and_explainability() {
         .recall(RecallRequest {
             scope: scope_a.clone(),
             query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
             limit: 5,
             filters: MemoryFilter::default(),
             include_explanations: true,
@@ -91,6 +92,7 @@ fn test_recall_and_explainability() {
         .recall(RecallRequest {
             scope: scope_b,
             query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
             limit: 5,
             filters: MemoryFilter::default(),
             include_explanations: false,
@@ -136,6 +138,7 @@ fn test_crash_recovery_rebuild() {
             .recall(RecallRequest {
                 scope: scope.clone(),
                 query_embedding: vec![0.0, 1.0, 0.0],
+                query_text: None,
                 limit: 5,
                 filters: MemoryFilter::default(),
                 include_explanations: true,
@@ -230,6 +233,7 @@ fn test_update_revision_concurrency_and_forget() {
         .recall(RecallRequest {
             scope: scope.clone(),
             query_embedding: vec![0.0, 1.0, 0.0],
+            query_text: None,
             limit: 5,
             filters: MemoryFilter::default(),
             include_explanations: false,
@@ -299,6 +303,7 @@ fn test_mmr_diversity_ranking() {
         .recall(RecallRequest {
             scope,
             query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
             limit: 2,
             filters: MemoryFilter::default(),
             include_explanations: false,
@@ -310,4 +315,71 @@ fn test_mmr_diversity_ranking() {
     assert_eq!(recall.items[0].memory.content, "Rust concurrency 1");
     // With MMR, the second selected item should be Python async IO rather than the duplicate
     assert_eq!(recall.items[1].memory.content, "Python async IO");
+}
+
+#[test]
+fn test_hybrid_recall_fts_and_rrf() {
+    let dir = tempdir().unwrap();
+    let config = MemoryConfig::builder(dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = MemoryStore::open(config).unwrap();
+    let scope = MemoryScope::new("acme", "knowledge").unwrap();
+
+    // Memory A: High semantic similarity to query embedding [1.0, 0.0, 0.0], generic content
+    store
+        .remember(RememberRequest {
+            operation_id: None,
+            scope: scope.clone(),
+            content: "General information about system architecture".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            kind: MemoryKind::Fact,
+            importance: 0.5,
+            expires_at_ms: None,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        })
+        .unwrap();
+
+    // Memory B: Low semantic similarity [0.0, 0.0, 1.0], but contains exact keyword "Priya"
+    store
+        .remember(RememberRequest {
+            operation_id: None,
+            scope: scope.clone(),
+            content: "User Priya prefers concise code reviews with performance metrics.".into(),
+            embedding: vec![0.0, 0.0, 1.0],
+            kind: MemoryKind::Preference,
+            importance: 0.9,
+            expires_at_ms: None,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        })
+        .unwrap();
+
+    // Recall with query_text = Some("Priya") and query_embedding = [1.0, 0.0, 0.0]
+    let recall = store
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: Some("Priya".into()),
+            limit: 5,
+            filters: MemoryFilter::default(),
+            include_explanations: true,
+            mmr_lambda: None,
+        })
+        .unwrap();
+
+    // Both items must be present
+    assert_eq!(recall.items.len(), 2);
+    let fts_item = recall
+        .items
+        .iter()
+        .find(|item| item.memory.content.contains("Priya"))
+        .expect("Priya record found via FTS fusion");
+
+    let notes = fts_item.explanation.as_ref().unwrap().policy_notes.clone();
+    assert!(notes.contains(&"fts5_lexical_candidate".to_string()));
 }

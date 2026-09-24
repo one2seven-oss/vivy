@@ -18,61 +18,55 @@ fn run_benchmark(dims: usize) {
     let n_queries = 100;
     let k = 10;
 
-    let (data, queries) = generate_data(dims, n, n_queries);
+    let (base_vectors, query_vectors) = generate_data(dims, n, n_queries);
 
-    // brute-force index
     println!("\nBuilding brute-force index ({n} vectors)...");
-    let t = Instant::now();
+    let start_time = Instant::now();
     let mut flat = FlatIndex::new(Metric::L2);
-    for (i, v) in data.iter().enumerate() {
+    for (i, v) in base_vectors.iter().enumerate() {
         flat.insert((i + 1) as u64, v.clone());
     }
-    let flat_time = t.elapsed();
-    println!("  flat build: {flat_time:?}");
+    println!("  flat build: {:?}", start_time.elapsed());
 
-    // exact k-NN via full scan
     println!("Computing ground truth...");
-    let gt: Vec<Vec<u64>> = queries
+    let ground_truth: Vec<Vec<u64>> = query_vectors
         .iter()
         .map(|q| flat.search(q, k).into_iter().map(|(id, _)| id).collect())
         .collect();
     drop(flat);
 
-    // HNSW index
     println!("\nBuilding HNSW index...");
-    let t = Instant::now();
+    let build_timer = Instant::now();
     let idx = VivyIndex::new(dims, Metric::L2, None::<&str>, None::<&str>).unwrap();
-    for v in &data {
+    for v in &base_vectors {
         black_box(idx.insert(black_box(v.clone()))).unwrap();
     }
-    let index_time = t.elapsed();
+    let index_time = build_timer.elapsed();
     println!(
         "  hnsw build: {index_time:?} ({:.0} vec/s)",
         n as f64 / index_time.as_secs_f64(),
     );
 
-    // 10 queries
-    for q in queries.iter().take(10) {
+    for q in query_vectors.iter().take(10) {
         black_box(idx.search(q, k)).unwrap();
     }
 
-    // Recall & latency
     println!("\nRecall@{k} benchmark ({n_queries} queries)...");
-    let t = Instant::now();
+    let bench_timer = Instant::now();
     let mut hits = 0usize;
     let mut search_latency = Duration::ZERO;
-    for (i, q) in queries.iter().enumerate() {
-        let tq = Instant::now();
+    for (i, q) in query_vectors.iter().enumerate() {
+        let query_timer = Instant::now();
         let results = idx.search(q, k).unwrap();
-        search_latency += tq.elapsed();
+        search_latency += query_timer.elapsed();
 
-        for gt_id in &gt[i] {
+        for gt_id in &ground_truth[i] {
             if results.iter().any(|(id, _)| id == gt_id) {
                 hits += 1;
             }
         }
     }
-    let elapsed = t.elapsed();
+    let elapsed = bench_timer.elapsed();
     let total_possible = n_queries * k;
     let recall = hits as f64 / total_possible as f64;
     let qps = n_queries as f64 / elapsed.as_secs_f64();
@@ -91,11 +85,11 @@ fn run_benchmark(dims: usize) {
 
 fn generate_data(dims: usize, n: usize, nq: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = rand::rng();
-    let data: Vec<Vec<f32>> = (0..n)
+    let base_vectors: Vec<Vec<f32>> = (0..n)
         .map(|_| (0..dims).map(|_| rng.random()).collect())
         .collect();
-    let queries: Vec<Vec<f32>> = (0..nq)
+    let query_vectors: Vec<Vec<f32>> = (0..nq)
         .map(|_| (0..dims).map(|_| rng.random()).collect())
         .collect();
-    (data, queries)
+    (base_vectors, query_vectors)
 }

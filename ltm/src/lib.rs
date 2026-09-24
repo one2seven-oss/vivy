@@ -110,9 +110,42 @@ impl MemoryStore {
     pub fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
         req.validate(self.config.dimensions())?;
 
-        let candidates = self
+        let candidate_limit = req.limit.min(self.config.max_recall_limit()) * 3;
+        let vector_candidates = self
             .index
-            .search(&req.query_embedding, req.limit.min(self.config.max_recall_limit()) * 3)?;
+            .search(&req.query_embedding, candidate_limit)?;
+
+        let fts_candidate_ids = if let Some(ref text) = req.query_text {
+            self.repo.search_fts(&req.scope, text, candidate_limit)?
+        } else {
+            Vec::new()
+        };
+
+        // Combine candidate IDs with RRF scoring & track sources
+        let mut rrf_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut from_fts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut from_vec: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (rank_idx, (mem_id, _)) in vector_candidates.iter().enumerate() {
+            let rrf = 1.0 / (60.0 + (rank_idx + 1) as f32);
+            *rrf_scores.entry(mem_id.clone()).or_insert(0.0) += rrf;
+            from_vec.insert(mem_id.clone());
+        }
+
+        for (rank_idx, mem_id) in fts_candidate_ids.iter().enumerate() {
+            let rrf = 1.0 / (60.0 + (rank_idx + 1) as f32);
+            *rrf_scores.entry(mem_id.clone()).or_insert(0.0) += rrf;
+            from_fts.insert(mem_id.clone());
+        }
+
+        let mut unique_candidate_ids: Vec<String> = rrf_scores.keys().cloned().collect();
+        unique_candidate_ids.sort_by(|a, b| {
+            rrf_scores
+                .get(b)
+                .unwrap()
+                .partial_cmp(rrf_scores.get(a).unwrap())
+                .unwrap()
+        });
 
         let mut items = Vec::new();
         let now_ms = std::time::SystemTime::now()
@@ -120,7 +153,7 @@ impl MemoryStore {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        for (mem_id, distance) in candidates {
+        for mem_id in unique_candidate_ids {
             if let Some(record) = self.repo.get_by_scope_and_id(&req.scope, &mem_id)? {
                 if record.status != MemoryStatus::Active {
                     continue;
@@ -144,29 +177,36 @@ impl MemoryStore {
                     }
                 }
 
+                let distance = vivy_core::distance::cosine(&req.query_embedding, &record.embedding);
                 let similarity = (1.0 - (distance / 2.0)).clamp(0.0, 1.0);
                 let importance = record.importance.clamp(0.0, 1.0);
 
-                // 7-day half-life decay (604_800_000 ms)
+                // half-life decay (604_800_000 ms)
                 let age_ms = (now_ms - record.created_at_ms).max(0) as f32;
                 let recency_decay = (-age_ms / (7.0 * 86_400_000.0)).exp();
 
                 let reinforcement = (record.access_count as f32 / 10.0).clamp(0.0, 1.0);
 
-                // 04-api-contract: 0.70*sim + 0.15*imp + 0.10*recency + 0.05*reinforcement
                 let total_score = 0.70 * similarity
                     + 0.15 * importance
                     + 0.10 * recency_decay
                     + 0.05 * reinforcement;
 
                 let explanation = if req.include_explanations {
+                    let mut notes = vec!["default_v1_scoring".to_string()];
+                    if from_fts.contains(&mem_id) {
+                        notes.push("fts5_lexical_candidate".to_string());
+                    }
+                    if from_vec.contains(&mem_id) && from_fts.contains(&mem_id) {
+                        notes.push("reciprocal_rank_fusion".to_string());
+                    }
                     Some(RecallExplanation {
                         total_score,
                         similarity_score: similarity,
                         importance_score: importance,
                         recency_score: recency_decay,
                         reinforcement_score: reinforcement,
-                        policy_notes: vec!["default_v1_scoring".to_string()],
+                        policy_notes: notes,
                     })
                 } else {
                     None

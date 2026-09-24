@@ -55,6 +55,49 @@ CREATE TABLE IF NOT EXISTS operations (
 );
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    id UNINDEXED,
+    tenant_id UNINDEXED,
+    namespace UNINDEXED,
+    content,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(id, tenant_id, namespace, content)
+    VALUES (new.id, new.tenant_id, new.namespace, CAST(new.content AS TEXT));
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    DELETE FROM memories_fts WHERE id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    DELETE FROM memories_fts WHERE id = old.id;
+    INSERT INTO memories_fts(id, tenant_id, namespace, content)
+    VALUES (new.id, new.tenant_id, new.namespace, CAST(new.content AS TEXT));
+END;
+"#;
+
+fn sanitize_fts_query(input: &str) -> String {
+    let clean: String = input
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { ' ' })
+        .collect();
+    let tokens: Vec<&str> = clean.split_whitespace().collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let phrase = format!("\"{}\"", tokens.join(" "));
+    let term_ors = tokens
+        .iter()
+        .map(|t| format!("\"{}\"", t))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("{} OR {}", phrase, term_ors)
+}
+
 pub struct Repository {
     conn: Mutex<Connection>,
 }
@@ -98,15 +141,22 @@ impl Repository {
             message: format!("Failed to start migration transaction: {}", e),
         })?;
 
-        tx.execute_batch(SCHEMA_V1)
+        let table_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
-                message: format!("Failed to apply schema v1: {}", e),
-            })?;
+                message: format!("Failed to check table existence: {}", e),
+            })?
+            .unwrap_or(false);
 
-        let version: Option<i64> = tx
-            .query_row(
-                "SELECT version FROM schema_migrations WHERE version = 1",
+        let current_ver: i64 = if table_exists {
+            tx.query_row(
+                "SELECT MAX(version) FROM schema_migrations",
                 [],
                 |row| row.get(0),
             )
@@ -114,20 +164,60 @@ impl Repository {
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
                 message: format!("Failed to check migration version: {}", e),
-            })?;
+            })?
+            .flatten()
+            .unwrap_or(0)
+        } else {
+            0
+        };
 
-        if version.is_none() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        if current_ver < 1 {
+            tx.execute_batch(SCHEMA_V1)
+                .map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("Failed to apply schema v1: {}", e),
+                })?;
             tx.execute(
                 "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (1, ?)",
                 params![now],
             )
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
-                message: format!("Failed to record schema migration: {}", e),
+                message: format!("Failed to record schema v1 migration: {}", e),
+            })?;
+        }
+
+        if current_ver < 2 {
+            tx.execute_batch(SCHEMA_V2)
+                .map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("Failed to apply schema v2: {}", e),
+                })?;
+            tx.execute(
+                r#"
+                INSERT OR IGNORE INTO memories_fts(id, tenant_id, namespace, content)
+                SELECT id, tenant_id, namespace, CAST(content AS TEXT)
+                FROM memories
+                WHERE status != 'deleted'
+                "#,
+                [],
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to backfill memories_fts: {}", e),
+            })?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (2, ?)",
+                params![now],
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to record schema v2 migration: {}", e),
             })?;
         }
 
@@ -799,6 +889,61 @@ impl Repository {
 
         Ok(())
     }
+
+    pub fn search_fts(
+        &self,
+        scope: &MemoryScope,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let sanitized = sanitize_fts_query(query_text);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+            SELECT f.id
+            FROM memories_fts f
+            JOIN memories m ON f.id = m.id
+            WHERE f.tenant_id = ?
+              AND f.namespace = ?
+              AND f.memories_fts MATCH ?
+              AND m.status = 'active'
+            ORDER BY rank
+            LIMIT ?
+            "#,
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to prepare FTS query: {}", e),
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![
+                    scope.tenant_id(),
+                    scope.namespace(),
+                    sanitized,
+                    limit as i64,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("FTS query failed: {}", e),
+            })?;
+
+        let mut ids = Vec::new();
+        for r in rows {
+            if let Ok(id) = r {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 #[cfg(test)]
@@ -894,5 +1039,76 @@ mod tests {
             .get_by_scope_and_id(&other_scope, "mem-secret")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn test_fts_retrieval_and_scope_isolation() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("memory.db");
+        let repo = Repository::open(&db_path).unwrap();
+
+        let scope_a = MemoryScope::new("tenant-a", "ns-1").unwrap();
+        let scope_b = MemoryScope::new("tenant-b", "ns-1").unwrap();
+
+        let record_a = MemoryRecord {
+            id: "mem-fts-1".into(),
+            scope: scope_a.clone(),
+            kind: MemoryKind::Fact,
+            content: "Quantum computing breakthrough in silicon quantum dots".into(),
+            content_hash: vec![1],
+            embedding: vec![0.1, 0.9],
+            embedding_model: "test".into(),
+            embedding_dims: 2,
+            importance: 0.9,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            last_accessed_at_ms: None,
+            access_count: 0,
+            expires_at_ms: None,
+            status: MemoryStatus::Active,
+            revision: 1,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        };
+
+        repo.insert_pending_memory(&record_a, None, 100).unwrap();
+        repo.set_status("mem-fts-1", MemoryStatus::Active).unwrap();
+
+        let record_b = MemoryRecord {
+            id: "mem-fts-2".into(),
+            scope: scope_b.clone(),
+            kind: MemoryKind::Fact,
+            content: "Quantum computing in silicon".into(),
+            content_hash: vec![2],
+            embedding: vec![0.1, 0.9],
+            embedding_model: "test".into(),
+            embedding_dims: 2,
+            importance: 0.9,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            last_accessed_at_ms: None,
+            access_count: 0,
+            expires_at_ms: None,
+            status: MemoryStatus::Active,
+            revision: 1,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        };
+
+        repo.insert_pending_memory(&record_b, None, 100).unwrap();
+        repo.set_status("mem-fts-2", MemoryStatus::Active).unwrap();
+
+        // Search scope_a for "Quantum silicon"
+        let matches_a = repo.search_fts(&scope_a, "Quantum silicon", 10).unwrap();
+        assert_eq!(matches_a, vec!["mem-fts-1"]);
+
+        // Search scope_b for "Quantum silicon"
+        let matches_b = repo.search_fts(&scope_b, "Quantum silicon", 10).unwrap();
+        assert_eq!(matches_b, vec!["mem-fts-2"]);
+
+        // Tombstone mem-fts-1 and verify FTS search omits deleted
+        repo.delete_memory(&scope_a, "mem-fts-1", None, 200).unwrap();
+        let matches_after_del = repo.search_fts(&scope_a, "Quantum silicon", 10).unwrap();
+        assert!(matches_after_del.is_empty());
     }
 }
