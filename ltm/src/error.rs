@@ -96,6 +96,12 @@ pub enum MemoryError {
         message: String,
     },
 
+    #[error("[{code}] Encryption key unavailable: {message}")]
+    EncryptionKeyUnavailable {
+        code: ErrorCode,
+        message: String,
+    },
+
     #[error("[{code}] Policy denied memory operation: {message}")]
     PolicyDenied {
         code: ErrorCode,
@@ -138,6 +144,7 @@ impl MemoryError {
             Self::StoreBusy { code, .. } => *code,
             Self::RecoveryRequired { code, .. } => *code,
             Self::CorruptStore { code, .. } => *code,
+            Self::EncryptionKeyUnavailable { code, .. } => *code,
             Self::PolicyDenied { code, .. } => *code,
             Self::InvalidFilter { code, .. } => *code,
             Self::InvalidInput { code, .. } => *code,
@@ -164,6 +171,13 @@ impl MemoryError {
         Self::NotFound {
             code: ErrorCode::NotFound,
             id: id.into(),
+        }
+    }
+
+    pub fn encryption_key_unavailable(msg: impl Into<String>) -> Self {
+        Self::EncryptionKeyUnavailable {
+            code: ErrorCode::EncryptionKeyUnavailable,
+            message: msg.into(),
         }
     }
 }

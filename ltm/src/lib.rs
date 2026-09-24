@@ -1,12 +1,15 @@
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod index_adapter;
 pub mod journal;
 pub mod model;
 pub mod namespace;
 pub mod repository;
+pub mod telemetry;
 
 pub use config::MemoryConfig;
+pub use crypto::{KeyProvider, MissingKeyProvider, NoOpDevKeyProvider};
 pub use error::{ErrorCode, MemoryError, Result};
 pub use index_adapter::{InMemoryTestIndex, VectorIndex, VivyVectorIndex};
 pub use model::{
@@ -15,6 +18,7 @@ pub use model::{
 };
 pub use namespace::MemoryScope;
 pub use repository::Repository;
+pub use telemetry::TelemetryRecord;
 
 use crate::journal::JournalCoordinator;
 use std::sync::Arc;

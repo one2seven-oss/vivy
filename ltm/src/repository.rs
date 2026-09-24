@@ -936,12 +936,7 @@ impl Repository {
                 message: format!("FTS query failed: {}", e),
             })?;
 
-        let mut ids = Vec::new();
-        for r in rows {
-            if let Ok(id) = r {
-                ids.push(id);
-            }
-        }
+        let ids = rows.flatten().collect();
         Ok(ids)
     }
 }
