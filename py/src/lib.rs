@@ -217,6 +217,100 @@ impl PyMemoryStore {
         })
     }
 
+    #[pyo3(signature = (records))]
+    fn remember_batch(
+        &self,
+        py: Python<'_>,
+        records: Vec<Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<String>> {
+        let mut rust_reqs = Vec::with_capacity(records.len());
+
+        for dict in records {
+            let tenant_id: String = dict
+                .get_item("tenant_id")?
+                .ok_or_else(|| PyValueError::new_err("missing tenant_id"))?
+                .extract()?;
+            let namespace: String = dict
+                .get_item("namespace")?
+                .ok_or_else(|| PyValueError::new_err("missing namespace"))?
+                .extract()?;
+            let content: String = dict
+                .get_item("content")?
+                .ok_or_else(|| PyValueError::new_err("missing content"))?
+                .extract()?;
+            let embedding: Vec<f32> = dict
+                .get_item("embedding")?
+                .ok_or_else(|| PyValueError::new_err("missing embedding"))?
+                .extract()?;
+
+            let importance: f32 = match dict.get_item("importance")? {
+                Some(val) => val.extract().unwrap_or(0.5),
+                None => 0.5,
+            };
+
+            let agent_id: Option<String> = match dict.get_item("agent_id")? {
+                Some(val) => val.extract().ok(),
+                None => None,
+            };
+
+            let user_id: Option<String> = match dict.get_item("user_id")? {
+                Some(val) => val.extract().ok(),
+                None => None,
+            };
+
+            let operation_id: Option<String> = match dict.get_item("operation_id")? {
+                Some(val) => val.extract().ok(),
+                None => None,
+            };
+
+            let expires_at_ms: Option<i64> = match dict.get_item("expires_at_ms")? {
+                Some(val) => val.extract().ok(),
+                None => None,
+            };
+
+            let kind_str: Option<String> = match dict.get_item("kind")? {
+                Some(val) => val.extract().ok(),
+                None => None,
+            };
+
+            let mut scope = vivy_memory::MemoryScope::new(&tenant_id, &namespace)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            if let Some(ref agent) = agent_id {
+                scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            }
+            if let Some(ref user) = user_id {
+                scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            }
+
+            let m_kind = match kind_str.as_deref().unwrap_or("fact").to_lowercase().as_str() {
+                "preference" => vivy_memory::MemoryKind::Preference,
+                "instruction" => vivy_memory::MemoryKind::Instruction,
+                "context" => vivy_memory::MemoryKind::Context,
+                "episodic" => vivy_memory::MemoryKind::Episodic,
+                _ => vivy_memory::MemoryKind::Fact,
+            };
+
+            rust_reqs.push(vivy_memory::RememberRequest {
+                operation_id,
+                scope,
+                content,
+                embedding,
+                kind: m_kind,
+                importance,
+                expires_at_ms,
+                metadata: std::collections::HashMap::new(),
+                source: std::collections::HashMap::new(),
+            });
+        }
+
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .remember_batch(rust_reqs)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (tenant_id, namespace, query_embedding, query_text=None, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None))]
     fn recall(
@@ -387,6 +481,26 @@ impl PyMemoryStore {
         py.allow_threads(move || {
             store
                 .forget(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (tenant_id, namespace, ids))]
+    fn forget_batch(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        ids: Vec<String>,
+    ) -> PyResult<()> {
+        let scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let id_strs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .forget_batch(&scope, &id_strs)
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })
     }

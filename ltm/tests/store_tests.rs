@@ -383,3 +383,67 @@ fn test_hybrid_recall_fts_and_rrf() {
     let notes = fts_item.explanation.as_ref().unwrap().policy_notes.clone();
     assert!(notes.contains(&"fts5_lexical_candidate".to_string()));
 }
+
+#[test]
+fn test_remember_batch_and_forget_batch() {
+    let dir = tempdir().unwrap();
+    let config = MemoryConfig::builder(dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = MemoryStore::open(config).unwrap();
+    let scope = MemoryScope::new("acme", "batch-test").unwrap();
+
+    // 1. Remember batch of 5 items
+    let mut reqs = Vec::new();
+    for i in 0..5 {
+        reqs.push(RememberRequest {
+            operation_id: Some(format!("op-batch-{}", i)),
+            scope: scope.clone(),
+            content: format!("Batch memory record {}", i),
+            embedding: vec![1.0, 0.0, 0.0],
+            kind: MemoryKind::Fact,
+            importance: 0.8,
+            expires_at_ms: None,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        });
+    }
+
+    let ids = store.remember_batch(reqs).unwrap();
+    assert_eq!(ids.len(), 5);
+
+    // 2. Recall should find all 5 records
+    let recall = store
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
+            limit: 10,
+            filters: MemoryFilter::default(),
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+    assert_eq!(recall.items.len(), 5);
+
+    // 3. Forget batch of first 3 items
+    let to_delete: Vec<&str> = ids[0..3].iter().map(|s| s.as_str()).collect();
+    store.forget_batch(&scope, &to_delete).unwrap();
+
+    // 4. Recall should now only find remaining 2 records
+    let recall_after = store
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
+            limit: 10,
+            filters: MemoryFilter::default(),
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+    assert_eq!(recall_after.items.len(), 2);
+}

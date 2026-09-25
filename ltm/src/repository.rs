@@ -340,6 +340,113 @@ impl Repository {
         Ok(())
     }
 
+    pub fn insert_pending_memory_batch(
+        &self,
+        records: &[MemoryRecord],
+        operation_ids: &[Option<String>],
+        now_ms: i64,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin transaction: {}", e),
+        })?;
+
+        {
+            let mut mem_stmt = tx.prepare(
+                r#"
+                INSERT INTO memories (
+                    id, tenant_id, namespace, agent_id, user_id, kind,
+                    content, content_hash, embedding, embedding_model, embedding_dims,
+                    importance, created_at_ms, updated_at_ms, last_accessed_at_ms,
+                    access_count, expires_at_ms, status, revision, metadata_json, source_json
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                "#,
+            ).map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to prepare batch memory insert statement: {}", e),
+            })?;
+
+            let mut op_stmt = tx.prepare(
+                r#"
+                INSERT INTO operations (
+                    operation_id, memory_id, kind, payload_json, state, created_at_ms, applied_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                "#,
+            ).map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to prepare batch operation insert statement: {}", e),
+            })?;
+
+            for (i, record) in records.iter().enumerate() {
+                let embedding_bytes: Vec<u8> = record
+                    .embedding
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect();
+                let metadata_json = serde_json::to_string(&record.metadata).unwrap_or_else(|_| "{}".into());
+                let source_json = serde_json::to_string(&record.source).unwrap_or_else(|_| "{}".into());
+
+                mem_stmt.execute(params![
+                    record.id,
+                    record.scope.tenant_id(),
+                    record.scope.namespace(),
+                    record.scope.agent_id(),
+                    record.scope.user_id(),
+                    format!("{:?}", record.kind).to_lowercase(),
+                    record.content.as_bytes(),
+                    record.content_hash,
+                    embedding_bytes,
+                    record.embedding_model,
+                    record.embedding_dims as i64,
+                    record.importance,
+                    record.created_at_ms,
+                    record.updated_at_ms,
+                    record.last_accessed_at_ms,
+                    record.access_count as i64,
+                    record.expires_at_ms,
+                    record.status.as_str(),
+                    record.revision as i64,
+                    metadata_json,
+                    source_json,
+                ]).map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("Failed to insert memory in batch: {}", e),
+                })?;
+
+                if let Some(op_id) = operation_ids.get(i).and_then(|opt| opt.as_deref()) {
+                    op_stmt.execute(params![
+                        op_id,
+                        record.id,
+                        "remember",
+                        serde_json::to_string(record).unwrap_or_else(|_| "{}".into()),
+                        "pending",
+                        now_ms,
+                    ]).map_err(|e| MemoryError::DatabaseError {
+                        code: ErrorCode::DatabaseError,
+                        message: format!("Failed to insert operation journal in batch: {}", e),
+                    })?;
+                }
+            }
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit batch memory transaction: {}", e),
+        })?;
+
+        Ok(())
+    }
+
     pub fn get_by_scope_and_id(
         &self,
         scope: &MemoryScope,
@@ -461,6 +568,39 @@ impl Repository {
         Ok(())
     }
 
+    pub fn set_status_batch(&self, ids: &[&str], status: MemoryStatus) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin transaction for set_status_batch: {}", e),
+        })?;
+
+        {
+            let mut stmt = tx.prepare("UPDATE memories SET status = ? WHERE id = ?")
+                .map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("Failed to prepare set_status_batch statement: {}", e),
+                })?;
+
+            for id in ids {
+                stmt.execute(params![status.as_str(), id])
+                    .map_err(|e| MemoryError::DatabaseError {
+                        code: ErrorCode::DatabaseError,
+                        message: format!("Failed to update status in batch: {}", e),
+                    })?;
+            }
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit set_status_batch transaction: {}", e),
+        })?;
+        Ok(())
+    }
+
     pub fn get_memory_id_by_operation_id(&self, op_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let mem_id = conn
@@ -486,6 +626,39 @@ impl Repository {
         .map_err(|e| MemoryError::DatabaseError {
             code: ErrorCode::DatabaseError,
             message: format!("Failed to mark operation applied: {}", e),
+        })?;
+        Ok(())
+    }
+
+    pub fn mark_operation_applied_batch(&self, op_ids: &[&str], applied_at_ms: i64) -> Result<()> {
+        if op_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin transaction for mark_operation_applied_batch: {}", e),
+        })?;
+
+        {
+            let mut stmt = tx.prepare("UPDATE operations SET state = 'applied', applied_at_ms = ? WHERE operation_id = ?")
+                .map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("Failed to prepare mark_operation_applied_batch statement: {}", e),
+                })?;
+
+            for op_id in op_ids {
+                stmt.execute(params![applied_at_ms, op_id])
+                    .map_err(|e| MemoryError::DatabaseError {
+                        code: ErrorCode::DatabaseError,
+                        message: format!("Failed to mark operation applied in batch: {}", e),
+                    })?;
+            }
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit mark_operation_applied_batch transaction: {}", e),
         })?;
         Ok(())
     }
@@ -885,6 +1058,72 @@ impl Repository {
         tx.commit().map_err(|e| MemoryError::DatabaseError {
             code: ErrorCode::DatabaseError,
             message: format!("Failed to commit delete transaction: {}", e),
+        })?;
+
+        Ok(())
+    }
+
+    pub fn delete_memory_batch(
+        &self,
+        scope: &MemoryScope,
+        ids: &[&str],
+        operation_ids: &[Option<String>],
+        now_ms: i64,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to begin delete batch transaction: {}", e),
+        })?;
+
+        {
+            let mut del_stmt = tx.prepare(
+                r#"
+                UPDATE memories SET
+                    status = 'deleted',
+                    updated_at_ms = ?
+                WHERE id = ? AND tenant_id = ? AND namespace = ?
+                "#,
+            ).map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to prepare delete batch statement: {}", e),
+            })?;
+
+            let mut op_stmt = tx.prepare(
+                r#"
+                INSERT INTO operations (
+                    operation_id, memory_id, kind, payload_json, state, created_at_ms, applied_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            ).map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to prepare delete operation batch statement: {}", e),
+            })?;
+
+            for (i, id) in ids.iter().enumerate() {
+                del_stmt.execute(params![now_ms, id, scope.tenant_id(), scope.namespace()])
+                    .map_err(|e| MemoryError::DatabaseError {
+                        code: ErrorCode::DatabaseError,
+                        message: format!("Failed to tombstone memory in batch: {}", e),
+                    })?;
+
+                if let Some(op_id) = operation_ids.get(i).and_then(|opt| opt.as_deref()) {
+                    op_stmt.execute(params![op_id, id, "delete", "{}", "applied", now_ms, now_ms])
+                        .map_err(|e| MemoryError::DatabaseError {
+                            code: ErrorCode::DatabaseError,
+                            message: format!("Failed to insert delete operation in batch: {}", e),
+                        })?;
+                }
+            }
+        }
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit delete batch transaction: {}", e),
         })?;
 
         Ok(())

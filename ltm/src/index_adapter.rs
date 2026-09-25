@@ -23,6 +23,22 @@ pub trait VectorIndex: Send + Sync {
 
     /// Return index diagnostic/health status.
     fn is_healthy(&self) -> bool;
+
+    /// Upsert multiple vectors associated with memory record IDs in batch.
+    fn upsert_batch(&self, items: &[(&str, &[f32])]) -> Result<()> {
+        for (id, vec) in items {
+            self.upsert(id, vec)?;
+        }
+        Ok(())
+    }
+
+    /// Mark multiple memory IDs as removed in batch.
+    fn remove_batch(&self, memory_ids: &[&str]) -> Result<()> {
+        for id in memory_ids {
+            self.remove(id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Vivy-backed implementation of VectorIndex.
@@ -90,10 +106,63 @@ impl VectorIndex for VivyVectorIndex {
         Ok(())
     }
 
+    fn upsert_batch(&self, items: &[(&str, &[f32])]) -> Result<()> {
+        for (_, vector) in items {
+            if vector.len() != self.dims {
+                return Err(MemoryError::DimensionMismatch {
+                    code: ErrorCode::DimensionMismatch,
+                    expected: self.dims,
+                    actual: vector.len(),
+                });
+            }
+        }
+
+        let num_ids: Vec<u64> = {
+            let mut id_map = self.id_to_u64.write();
+            let mut u64_map = self.u64_to_id.write();
+            items
+                .iter()
+                .map(|(mem_id, _)| {
+                    let id = *id_map
+                        .entry(mem_id.to_string())
+                        .or_insert_with(|| self.next_u64.fetch_add(1, Ordering::Relaxed));
+                    u64_map.insert(id, mem_id.to_string());
+                    id
+                })
+                .collect()
+        };
+
+        {
+            let mut tombstones = self.tombstones.write();
+            for (mem_id, _) in items {
+                tombstones.remove(*mem_id);
+            }
+        }
+
+        let idx = self.index.read();
+        for (i, (_, vector)) in items.iter().enumerate() {
+            idx.insert_with_id(num_ids[i], vector.to_vec())
+                .map_err(|e| MemoryError::DatabaseError {
+                    code: ErrorCode::DatabaseError,
+                    message: format!("VivyIndex batch insert failed: {:?}", e),
+                })?;
+        }
+
+        Ok(())
+    }
+
     fn remove(&self, memory_id: &str) -> Result<()> {
         self.tombstones
             .write()
             .insert(memory_id.to_string(), true);
+        Ok(())
+    }
+
+    fn remove_batch(&self, memory_ids: &[&str]) -> Result<()> {
+        let mut tombstones = self.tombstones.write();
+        for id in memory_ids {
+            tombstones.insert(id.to_string(), true);
+        }
         Ok(())
     }
 

@@ -107,6 +107,56 @@ impl MemoryStore {
             .coordinate_remember(record, req.operation_id)
     }
 
+    /// Store multiple observations/facts into durable memory in a single atomic transaction.
+    pub fn remember_batch(&self, reqs: Vec<RememberRequest>) -> Result<Vec<String>> {
+        if reqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        for req in &reqs {
+            req.validate(self.config.dimensions())?;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let mut operation_ids = Vec::with_capacity(reqs.len());
+        let records: Vec<MemoryRecord> = reqs
+            .into_iter()
+            .map(|req| {
+                operation_ids.push(req.operation_id);
+                let id = Uuid::new_v4().to_string();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&req.content, &mut hasher);
+                let content_hash = std::hash::Hasher::finish(&hasher).to_le_bytes().to_vec();
+
+                MemoryRecord {
+                    id,
+                    scope: req.scope,
+                    kind: req.kind,
+                    content: req.content,
+                    content_hash,
+                    embedding: req.embedding,
+                    embedding_model: self.config.embedding_model().to_string(),
+                    embedding_dims: self.config.dimensions(),
+                    importance: req.importance,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                    last_accessed_at_ms: None,
+                    access_count: 0,
+                    expires_at_ms: req.expires_at_ms,
+                    status: MemoryStatus::Pending,
+                    revision: 1,
+                    metadata: req.metadata,
+                    source: req.source,
+                }
+            })
+            .collect();
+
+        self.coordinator.coordinate_remember_batch(records, operation_ids)
+    }
+
     /// Fetch a memory by ID within scope.
     pub fn get(&self, scope: &MemoryScope, id: &str) -> Result<Option<MemoryRecord>> {
         self.repo.get_by_scope_and_id(scope, id)
@@ -340,6 +390,16 @@ impl MemoryStore {
     pub fn forget(&self, req: ForgetRequest) -> Result<()> {
         self.coordinator
             .coordinate_forget(&req.scope, &req.id, req.operation_id)
+    }
+
+    /// Forget/delete multiple memory records in a single atomic transaction.
+    pub fn forget_batch(&self, scope: &MemoryScope, ids: &[&str]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let operation_ids = vec![None; ids.len()];
+        self.coordinator
+            .coordinate_forget_batch(scope, ids, operation_ids)
     }
 
     /// Return a non-blocking operational health snapshot of the memory store.
