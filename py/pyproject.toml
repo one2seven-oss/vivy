@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "vivy"
+name = "vivy-vdb"
 version = "0.1.0"
 description = "Vector search that lives on one machine"
 requires-python = ">=3.8"

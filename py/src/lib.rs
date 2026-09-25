@@ -267,6 +267,109 @@ impl PyMemoryStore {
         Ok(results)
     }
 
+    #[pyo3(signature = (tenant_id, namespace, id, agent_id=None, user_id=None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        id: &str,
+        agent_id: Option<&str>,
+        user_id: Option<&str>,
+    ) -> PyResult<Option<PyObject>> {
+        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(agent) = agent_id {
+            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        if let Some(user) = user_id {
+            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+
+        let store = self.inner.clone();
+        let record = py.allow_threads(move || {
+            store
+                .get(&scope, id)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+
+        match record {
+            Some(rec) if rec.status == vivy_memory::MemoryStatus::Active => {
+                let dict = PyDict::new(py);
+                dict.set_item("id", rec.id)?;
+                dict.set_item("tenant_id", rec.scope.tenant_id())?;
+                dict.set_item("namespace", rec.scope.namespace())?;
+                dict.set_item("content", rec.content)?;
+                dict.set_item("importance", rec.importance)?;
+                dict.set_item("revision", rec.revision)?;
+                dict.set_item("created_at_ms", rec.created_at_ms)?;
+                dict.set_item("updated_at_ms", rec.updated_at_ms)?;
+                dict.set_item("expires_at_ms", rec.expires_at_ms)?;
+                Ok(Some(dict.into()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (tenant_id, namespace, id, expected_revision, content=None, embedding=None, kind=None, importance=None, agent_id=None, user_id=None, operation_id=None, expires_at_ms=None))]
+    fn update(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        id: &str,
+        expected_revision: u64,
+        content: Option<String>,
+        embedding: Option<Vec<f32>>,
+        kind: Option<&str>,
+        importance: Option<f32>,
+        agent_id: Option<&str>,
+        user_id: Option<&str>,
+        operation_id: Option<String>,
+        expires_at_ms: Option<i64>,
+    ) -> PyResult<()> {
+        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(agent) = agent_id {
+            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        if let Some(user) = user_id {
+            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+
+        let m_kind = match kind {
+            Some(k) => match k.to_lowercase().as_str() {
+                "preference" => Some(vivy_memory::MemoryKind::Preference),
+                "fact" => Some(vivy_memory::MemoryKind::Fact),
+                "instruction" => Some(vivy_memory::MemoryKind::Instruction),
+                "context" => Some(vivy_memory::MemoryKind::Context),
+                _ => Some(vivy_memory::MemoryKind::Episodic),
+            },
+            None => None,
+        };
+
+        let req = vivy_memory::UpdateRequest {
+            operation_id,
+            scope,
+            id: id.to_string(),
+            expected_revision,
+            content,
+            embedding,
+            kind: m_kind,
+            importance,
+            expires_at_ms: expires_at_ms.map(Some),
+            metadata_patch: None,
+        };
+
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .update(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(signature = (tenant_id, namespace, id))]
     fn forget(
         &self,
