@@ -4,12 +4,13 @@
 
 [![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
 [![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-BSL--1.1-green)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
 [![HNSW](https://img.shields.io/badge/index-HNSW-8A2BE2)](#)
 [![WAL](https://img.shields.io/badge/crash--safe-WAL-blue)](#)
 [![FTS5](https://img.shields.io/badge/hybrid-FTS5%20%2B%20Vector%20RRF-blue)](#)
 [![PyO3](https://img.shields.io/badge/bindings-PyO3-yellow)](#)
+[![Release Candidate](https://img.shields.io/badge/status-v0.1.0--RC1%20Ready-brightgreen)](#)
 
 A local, durable long-term memory (LTM) runtime and single-machine vector engine for AI agents. No cloud databases, no network latency, no external daemons. Rust core with PyO3 Python bindings.
 
@@ -26,12 +27,30 @@ A local, durable long-term memory (LTM) runtime and single-machine vector engine
 
 ---
 
+## Benchmark Performance Matrix
+
+Measured on single-machine benchmark suite (`cargo run --release --package bench`):
+
+| Metric / Scenario | Measured Value | Description |
+| :--- | :--- | :--- |
+| **Cold Start Latency** | `~51 ms` | Time to initialize fresh database, SQLite WAL, & vector engine |
+| **Warm Start Latency** | `~51 ms` | Time to recover startup & replay operation journal (500 records) |
+| **Write Throughput** | `5,216 writes/sec` | Dual-write durability (SQLite WAL commit + HNSW graph update) |
+| **Hybrid Recall Throughput** | `305.1 QPS` | Dense Vector KNN + SQLite FTS5 + RRF Fusion + MMR Rerank |
+| **Hybrid Recall Latency** | `3.27 ms` | End-to-end mean search & reranking latency |
+| **Vector Engine (64-dim)** | `6,012 QPS` | Pure HNSW vector search throughput (`0.16 ms` mean latency) |
+| **Vector Engine (512-dim)** | `1,433 QPS` | Pure HNSW vector search throughput (`0.69 ms` mean latency) |
+| **Tombstone Vacuum Speed** | `74 ms` | Resumable physical tombstone scrubbing (100 rows batch) |
+
+---
+
 ## Key Capabilities
 
 * **Durable Agent Memory (`vivy-memory`)**: SQLite WAL serves as canonical truth for memory records, revisions, and operation journal. Vector index acts as a derived, auto-rebuildable accelerator.
-* **Multi-Tenant Isolation**: Enforces tenant, namespace, agent, and user boundaries at API entry and SQL level. Zero cross-tenant data leakage.
+* **Strict Multi-Tenant Isolation**: Enforces tenant, namespace, agent, and user boundaries at API entry and SQL level. Zero cross-tenant data leakage.
 * **Hybrid Candidate Recall**: Combines SQLite FTS5 lexical keyword matching with dense HNSW vector search using Reciprocal Rank Fusion (RRF).
 * **Transparent Reranking & MMR**: 4-component weighted scoring (Similarity, Importance, Recency, Reinforcement) plus optional Maximal Marginal Relevance (MMR) deduplication.
+* **Security & Operations Primitives**: Encrypted storage interfaces (`KeyProvider`), telemetry redaction (`TelemetryRecord`), non-blocking health checks (`StoreHealth`), and resumable vacuuming (`vacuum_tombstones`).
 * **High Performance Vector Search (`vivy-core`)**: HNSW vector graph with non-blocking inserts and Roaring bitmap metadata filtering.
 
 ---
@@ -104,6 +123,11 @@ for memory_id, content, score in results:
 
 # Soft-delete / tombstone a memory
 store.forget(tenant_id="acme", namespace="support", id=mem_id)
+
+# Physical maintenance & health check
+health = store.health()
+print(f"Store active: {health['total_active_records']}, tombstones: {health['total_tombstoned_records']}")
+purged = store.vacuum_tombstones(batch_size=100)
 ```
 
 ### Low-Level Vector Search (`Index`)
@@ -120,33 +144,36 @@ results = idx.search([0.5] * 768, k=5, filter={"color": "red"})
 
 ---
 
-## Build & Test
-
-### Rust Workspace
+## Build & Verification
 
 ```sh
-# Run workspace test suite across all crates
+# Run workspace test suite (48 integration/unit tests)
 cargo test --workspace
 
-# Run release build
+# Run zero-warning clippy check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Build release binaries
 cargo build --release
-```
 
-### Python Bindings
-
-```sh
-pip install maturin
-cd py && maturin develop --release
-```
-
-### Run Benchmarks
-
-```sh
-cargo run --release --bin vivy-bench
+# Run performance benchmark suite
+cargo run --release --package bench
 ```
 
 ---
 
-## License
+## Licensing & Commercial Terms
 
-Distributed under the [Apache 2.0 License](LICENSE).
+**Vivy** components (`vivy-core`, `vivy-memory`, `vivy-py`, `bench`) are published under **The Business Source License 1.1 (BSL-1.1)** (see [`LICENSE`](LICENSE)).
+
+### Permitted Uses (BSL 1.1 Additional Use Grant)
+- **Non-Production & Evaluation**: Free use for development, testing, research, and evaluation.
+- **Production Workloads**: Free use in production for non-commercial applications, single-node deployments, and internal AI agent workloads, provided Vivy is not offered as a managed SaaS or cloud API vector service to third parties.
+
+### Commercial Pro / Enterprise Licensing
+For managed cloud service providers or enterprise deployments requiring custom SLAs:
+- Cloud cluster synchronization & distributed multi-region replication.
+- Hardware Security Module (HSM) & AWS KMS / GCP KMS `KeyProvider` integration.
+- Role-Based Access Control (RBAC) policy enforcement engine.
+
+---

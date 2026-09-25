@@ -1,0 +1,33 @@
+Business Source License 1.1
+
+Parameters:
+
+Licensor: The Vivy Authors
+Licensed Work: Vivy (including vivy-core, vivy-memory, vivy-py, and associated tools)
+
+Additional Use Grant:
+You may use the Licensed Work in non-production environments for development, testing, research, and evaluation. You may also use the Licensed Work in production environments provided that:
+1. The Licensed Work is not offered or made available as a managed service, hosted service, or cloud API service to third parties; and
+2. The Licensed Work is deployed in single-node environments or internal application workloads.
+
+---
+
+License Text:
+
+1. GRANT OF LICENSE.
+Licensor hereby grants you a non-exclusive, royalty-free, worldwide right and license to use, copy, modify, display, redistribute, and create derivative works of the Licensed Work, subject to the conditions and limitations set forth herein.
+
+2. USE LIMITATIONS.
+You may exercise the rights granted in Section 1 solely in accordance with the Additional Use Grant specified above. Any use of the Licensed Work in production that exceeds or violates the Additional Use Grant requires a commercial license from Licensor.
+
+3. REDISTRIBUTION.
+Redistribution of the Licensed Work, modified or unmodified, must include:
+  (a) A copy of this License;
+  (b) The original copyright and attribution notices; and
+  (c) Notice of any modifications made to the Licensed Work.
+
+4. RESERVATION OF RIGHTS.
+Licensor reserves all rights not expressly granted herein. No express or implied license is granted under any patent, trademark, trade secret, or other intellectual property right of Licensor except as explicitly set forth in this License.
+
+5. DISCLAIMER OF WARRANTIES.
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE LICENSED WORK OR THE USE OR OTHER DEALINGS IN THE LICENSED WORK.

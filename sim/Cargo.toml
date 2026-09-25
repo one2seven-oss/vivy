@@ -2,10 +2,12 @@
 name = "bench"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "BSL-1.1"
 description = "Benchmarking harness for Vivy"
 publish = false
 
 [dependencies]
-vivy-core = { path = "../vec" }
+vivy-core = { version = "0.1.0", path = "../vec" }
+vivy-memory = { version = "0.1.0", path = "../ltm" }
+tempfile = "3"
 rand = "0.9"

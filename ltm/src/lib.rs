@@ -1,6 +1,7 @@
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod health;
 pub mod index_adapter;
 pub mod journal;
 pub mod model;
@@ -11,6 +12,7 @@ pub mod telemetry;
 pub use config::MemoryConfig;
 pub use crypto::{KeyProvider, MissingKeyProvider, NoOpDevKeyProvider};
 pub use error::{ErrorCode, MemoryError, Result};
+pub use health::StoreHealth;
 pub use index_adapter::{InMemoryTestIndex, VectorIndex, VivyVectorIndex};
 pub use model::{
     ForgetRequest, MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus, RecallExplanation,
@@ -338,5 +340,53 @@ impl MemoryStore {
     pub fn forget(&self, req: ForgetRequest) -> Result<()> {
         self.coordinator
             .coordinate_forget(&req.scope, &req.id, req.operation_id)
+    }
+
+    /// Return a non-blocking operational health snapshot of the memory store.
+    pub fn health(&self) -> Result<StoreHealth> {
+        let (active_count, tombstoned_count, pending_ops_count) =
+            self.repo.get_health_counts()?;
+
+        let db_path = self.config.path().join("memory.db");
+        let wal_path = self.config.path().join("memory.db-wal");
+
+        let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let wal_size_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        let is_healthy = self.index.is_healthy();
+
+        Ok(StoreHealth {
+            is_healthy,
+            total_active_records: active_count,
+            total_tombstoned_records: tombstoned_count,
+            pending_operations_count: pending_ops_count,
+            index_rebuild_required: !is_healthy,
+            db_size_bytes,
+            wal_size_bytes,
+        })
+    }
+
+    /// Perform a resumable physical cleanup of tombstoned and expired memory records.
+    pub fn vacuum_tombstones(&self, batch_size: usize) -> Result<usize> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let purged = self.repo.vacuum_tombstoned_records(batch_size, now_ms)?;
+        if purged > 0 {
+            self.rebuild_index()?;
+        }
+        Ok(purged)
+    }
+
+    /// Force a rebuild of the in-memory vector accelerator index from canonical active records.
+    pub fn rebuild_index(&self) -> Result<()> {
+        let active_records = self.repo.get_all_active_records()?;
+        self.index.rebuild(Box::new(active_records.iter()))
     }
 }

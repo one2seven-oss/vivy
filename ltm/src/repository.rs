@@ -939,6 +939,81 @@ impl Repository {
         let ids = rows.flatten().collect();
         Ok(ids)
     }
+
+    pub fn get_health_counts(&self) -> Result<(usize, usize, usize)> {
+        let conn = self.conn.lock();
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to count active records: {}", e),
+            })?;
+
+        let tombstoned_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE status = 'deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to count tombstoned records: {}", e),
+            })?;
+
+        let pending_ops_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to count pending operations: {}", e),
+            })?;
+
+        Ok((
+            active_count as usize,
+            tombstoned_count as usize,
+            pending_ops_count as usize,
+        ))
+    }
+
+    pub fn vacuum_tombstoned_records(&self, batch_size: usize, now_ms: i64) -> Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to start vacuum transaction: {}", e),
+        })?;
+
+        let purged_count = tx
+            .execute(
+                r#"
+            DELETE FROM memories
+            WHERE id IN (
+                SELECT id FROM memories
+                WHERE status = 'deleted'
+                   OR (expires_at_ms IS NOT NULL AND expires_at_ms <= ?)
+                LIMIT ?
+            )
+            "#,
+                params![now_ms, batch_size as i64],
+            )
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Failed to vacuum tombstoned records: {}", e),
+            })?;
+
+        tx.commit().map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to commit vacuum transaction: {}", e),
+        })?;
+
+        Ok(purged_count)
+    }
 }
 
 #[cfg(test)]

@@ -2,13 +2,13 @@
 name = "vivy-py"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "BSL-1.1"
 description = "Python bindings for Vivy vector search engine"
 
 [dependencies]
-vivy-core = { path = "../vec" }
-vivy-memory = { path = "../ltm" }
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+vivy-core = { version = "0.1.0", path = "../vec" }
+vivy-memory = { version = "0.1.0", path = "../ltm" }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 serde_json = "1"
 
 [lib]

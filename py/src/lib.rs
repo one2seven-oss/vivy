@@ -287,6 +287,42 @@ impl PyMemoryStore {
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })
     }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let store = self.inner.clone();
+        let health = py.allow_threads(move || {
+            store.health().map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("is_healthy", health.is_healthy)?;
+        dict.set_item("total_active_records", health.total_active_records)?;
+        dict.set_item("total_tombstoned_records", health.total_tombstoned_records)?;
+        dict.set_item("pending_operations_count", health.pending_operations_count)?;
+        dict.set_item("index_rebuild_required", health.index_rebuild_required)?;
+        dict.set_item("db_size_bytes", health.db_size_bytes)?;
+        dict.set_item("wal_size_bytes", health.wal_size_bytes)?;
+        Ok(dict.into())
+    }
+
+    #[pyo3(signature = (batch_size=100))]
+    fn vacuum_tombstones(&self, py: Python<'_>, batch_size: usize) -> PyResult<usize> {
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .vacuum_tombstones(batch_size)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    fn rebuild_index(&self, py: Python<'_>) -> PyResult<()> {
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .rebuild_index()
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
 }
 
 #[pymodule]

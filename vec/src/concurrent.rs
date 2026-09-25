@@ -406,14 +406,19 @@ fn compactor_loop(
     metric: Metric,
 ) {
     let threshold = 10_000usize;
+    let mut tick_counter = 0u32;
     while running.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_secs(5));
-        let total_len: usize = shards.iter().map(|s| s.read().len()).sum();
-        if total_len >= threshold {
-            if let Some(ref dir) = data_dir {
-                let wal_ref = wal.as_deref();
-                if let Err(e) = run_compaction(dims, &shards, &sealed, dir, wal_ref, metric) {
-                    warn!("compaction failed: {e}");
+        thread::sleep(Duration::from_millis(50));
+        tick_counter += 1;
+        if tick_counter >= 100 {
+            tick_counter = 0;
+            let total_len: usize = shards.iter().map(|s| s.read().len()).sum();
+            if total_len >= threshold {
+                if let Some(ref dir) = data_dir {
+                    let wal_ref = wal.as_deref();
+                    if let Err(e) = run_compaction(dims, &shards, &sealed, dir, wal_ref, metric) {
+                        warn!("compaction failed: {e}");
+                    }
                 }
             }
         }

@@ -7,7 +7,7 @@ name = "vivy"
 version = "0.1.0"
 description = "Vector search that lives on one machine"
 requires-python = ">=3.8"
-license = "Apache-2.0"
+license = "BSL-1.1"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

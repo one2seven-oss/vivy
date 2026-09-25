@@ -2,7 +2,7 @@
 name = "vivy-core"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "BSL-1.1"
 description = "Core vector index engine for Vivy — single-machine, memory-honest vector search"
 
 [features]
