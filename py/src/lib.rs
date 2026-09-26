@@ -11,12 +11,68 @@
 //! - Filter dicts are always AND-combined. The flat dict form is ergonomic
 //!   for the common case (`color=red AND year=2024`).
 
-use pyo3::exceptions::PyValueError;
+use numpy::PyReadonlyArray1;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use vivy_core::concurrent::VivyIndex;
 use vivy_core::distance::Metric;
 use vivy_core::filter::FilterExpr;
+
+enum PyVectorInput<'py> {
+    List(Vec<f32>),
+    NumPy(PyReadonlyArray1<'py, f32>),
+}
+
+impl<'py> PyVectorInput<'py> {
+    fn extract(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if obj.is_instance_of::<pyo3::types::PyList>() {
+            if let Ok(list) = obj.extract::<Vec<f32>>() {
+                return Ok(PyVectorInput::List(list));
+            }
+        }
+        if let Ok(arr) = obj.extract::<PyReadonlyArray1<'py, f32>>() {
+            if arr.as_slice().is_ok() {
+                Ok(PyVectorInput::NumPy(arr))
+            } else {
+                Err(PyValueError::new_err(
+                    "numpy array must be a contiguous 1D array with dtype=float32",
+                ))
+            }
+        } else if obj.hasattr("__array_interface__")? {
+            Err(PyTypeError::new_err(
+                "vector must be a list of floats or a contiguous 1D numpy array with dtype=float32",
+            ))
+        } else if let Ok(list) = obj.extract::<Vec<f32>>() {
+            Ok(PyVectorInput::List(list))
+        } else {
+            Err(PyTypeError::new_err(
+                "vector must be a list of floats or a contiguous 1D numpy array with dtype=float32",
+            ))
+        }
+    }
+
+    fn as_slice(&self) -> PyResult<&[f32]> {
+        match self {
+            PyVectorInput::List(v) => Ok(v.as_slice()),
+            PyVectorInput::NumPy(arr) => arr.as_slice().map_err(|e| {
+                PyValueError::new_err(format!("failed to access contiguous numpy slice: {e}"))
+            }),
+        }
+    }
+
+    fn into_vec(self) -> PyResult<Vec<f32>> {
+        match self {
+            PyVectorInput::List(v) => Ok(v),
+            PyVectorInput::NumPy(arr) => {
+                let slice = arr.as_slice().map_err(|e| {
+                    PyValueError::new_err(format!("failed to access contiguous numpy slice: {e}"))
+                })?;
+                Ok(slice.to_vec())
+            }
+        }
+    }
+}
 
 // Python-facing handle wrapping VivyIndex. Single opaque object with insert/search.
 #[pyclass]
@@ -40,10 +96,19 @@ impl Index {
     }
 
     #[pyo3(signature = (vector, metadata=None))]
-    fn insert(&self, py: Python<'_>, vector: Vec<f32>, metadata: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
+    fn insert(
+        &self,
+        py: Python<'_>,
+        vector: Bound<'_, PyAny>,
+        metadata: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<u64> {
         let meta = parse_metadata(metadata)?;
+        let vec_input = PyVectorInput::extract(&vector)?;
+        let vec_data = vec_input.into_vec()?;
+
         py.allow_threads(move || {
-            self.inner.insert_with_metadata(vector, meta)
+            self.inner
+                .insert_with_metadata(vec_data, meta)
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })
     }
@@ -52,7 +117,7 @@ impl Index {
     fn insert_batch(
         &self,
         py: Python<'_>,
-        vectors: Vec<Vec<f32>>,
+        vectors: Bound<'_, PyAny>,
         metadata: Option<Vec<Option<Bound<'_, PyDict>>>>,
     ) -> PyResult<Vec<u64>> {
         let metas = match metadata {
@@ -70,8 +135,33 @@ impl Index {
             None => None,
         };
 
+        let parsed_vectors: Vec<Vec<f32>> = if let Ok(arr2) = vectors.extract::<numpy::PyReadonlyArray2<'_, f32>>() {
+            let slice2 = arr2.as_array();
+            let mut vecs = Vec::with_capacity(slice2.shape()[0]);
+            for row in slice2.outer_iter() {
+                if let Some(s) = row.as_slice() {
+                    vecs.push(s.to_vec());
+                } else {
+                    return Err(PyValueError::new_err("2D numpy array must be C-contiguous float32"));
+                }
+            }
+            vecs
+        } else if let Ok(seq) = vectors.extract::<Vec<Bound<'_, PyAny>>>() {
+            let mut vecs = Vec::with_capacity(seq.len());
+            for item in seq {
+                let vec_input = PyVectorInput::extract(&item)?;
+                vecs.push(vec_input.into_vec()?);
+            }
+            vecs
+        } else {
+            return Err(PyTypeError::new_err(
+                "vectors must be a list of vectors or a 2D float32 numpy array",
+            ));
+        };
+
         py.allow_threads(move || {
-            self.inner.insert_batch_with_metadata(vectors, metas)
+            self.inner
+                .insert_batch_with_metadata(parsed_vectors, metas)
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })
     }
@@ -80,13 +170,17 @@ impl Index {
     fn search(
         &self,
         py: Python<'_>,
-        query: Vec<f32>,
+        query: Bound<'_, PyAny>,
         k: usize,
         filter: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<(u64, f32)>> {
         let expr = parse_filter(filter)?;
+        let vec_input = PyVectorInput::extract(&query)?;
+        let query_slice = vec_input.as_slice()?;
+
         let results = py.allow_threads(move || {
-            self.inner.search_filtered(&query, k, expr.as_ref())
+            self.inner
+                .search_filtered(query_slice, k, expr.as_ref())
                 .map_err(|e| PyValueError::new_err(e.to_string()))
         })?;
         Ok(results)
@@ -172,7 +266,7 @@ impl PyMemoryStore {
         tenant_id: &str,
         namespace: &str,
         content: &str,
-        embedding: Vec<f32>,
+        embedding: Bound<'_, PyAny>,
         kind: &str,
         importance: f32,
         agent_id: Option<&str>,
@@ -197,11 +291,14 @@ impl PyMemoryStore {
             _ => vivy_memory::MemoryKind::Episodic,
         };
 
+        let vec_input = PyVectorInput::extract(&embedding)?;
+        let vec_data = vec_input.into_vec()?;
+
         let req = vivy_memory::RememberRequest {
             operation_id,
             scope,
             content: content.to_string(),
-            embedding,
+            embedding: vec_data,
             kind: m_kind,
             importance,
             expires_at_ms,
@@ -238,10 +335,11 @@ impl PyMemoryStore {
                 .get_item("content")?
                 .ok_or_else(|| PyValueError::new_err("missing content"))?
                 .extract()?;
-            let embedding: Vec<f32> = dict
+            let embedding_obj = dict
                 .get_item("embedding")?
-                .ok_or_else(|| PyValueError::new_err("missing embedding"))?
-                .extract()?;
+                .ok_or_else(|| PyValueError::new_err("missing embedding"))?;
+            let vec_input = PyVectorInput::extract(&embedding_obj)?;
+            let embedding = vec_input.into_vec()?;
 
             let importance: f32 = match dict.get_item("importance")? {
                 Some(val) => val.extract().unwrap_or(0.5),
@@ -318,7 +416,7 @@ impl PyMemoryStore {
         py: Python<'_>,
         tenant_id: &str,
         namespace: &str,
-        query_embedding: Vec<f32>,
+        query_embedding: Bound<'_, PyAny>,
         query_text: Option<String>,
         limit: usize,
         agent_id: Option<&str>,
@@ -335,9 +433,12 @@ impl PyMemoryStore {
             scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
 
+        let vec_input = PyVectorInput::extract(&query_embedding)?;
+        let query_vec = vec_input.into_vec()?;
+
         let req = vivy_memory::RecallRequest {
             scope,
-            query_embedding,
+            query_embedding: query_vec,
             query_text,
             limit,
             filters: vivy_memory::MemoryFilter::default(),
@@ -415,7 +516,7 @@ impl PyMemoryStore {
         id: &str,
         expected_revision: u64,
         content: Option<String>,
-        embedding: Option<Vec<f32>>,
+        embedding: Option<Bound<'_, PyAny>>,
         kind: Option<&str>,
         importance: Option<f32>,
         agent_id: Option<&str>,
@@ -443,13 +544,18 @@ impl PyMemoryStore {
             None => None,
         };
 
+        let embedding_vec = match embedding {
+            Some(obj) => Some(PyVectorInput::extract(&obj)?.into_vec()?),
+            None => None,
+        };
+
         let req = vivy_memory::UpdateRequest {
             operation_id,
             scope,
             id: id.to_string(),
             expected_revision,
             content,
-            embedding,
+            embedding: embedding_vec,
             kind: m_kind,
             importance,
             expires_at_ms: expires_at_ms.map(Some),

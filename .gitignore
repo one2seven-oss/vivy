@@ -10,3 +10,4 @@ venv/
 *.o
 guidedoc/
 Cargo.lock
+*.lock

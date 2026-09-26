@@ -1,16 +1,17 @@
-<p align="center">
-  <img src="assets/vivy.png" alt="Vivy">
-</p>
+<div align="center">
+  <img src="assets/vivy.png" alt="Vivy" width="200" />
+  <br><br>
 
-[![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
-[![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
-[![License](https://img.shields.io/badge/license-BSL--1.1-green)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
-[![HNSW](https://img.shields.io/badge/index-HNSW-8A2BE2)](#)
-[![WAL](https://img.shields.io/badge/crash--safe-WAL-blue)](#)
-[![FTS5](https://img.shields.io/badge/hybrid-FTS5%20%2B%20Vector%20RRF-blue)](#)
-[![PyO3](https://img.shields.io/badge/bindings-PyO3-yellow)](#)
-[![Release Candidate](https://img.shields.io/badge/status-v0.1.0--RC1%20Ready-brightgreen)](#)
+  [![Crates.io](https://img.shields.io/crates/v/vivy-core?label=vivy-core)](https://crates.io/crates/vivy-core)
+  [![PyPI](https://img.shields.io/badge/pypi-vivy--vdb-blue)](https://pypi.org/project/vivy-vdb/)
+  [![License](https://img.shields.io/badge/license-BSL--1.1-green)](LICENSE)
+  [![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
+  [![HNSW](https://img.shields.io/badge/index-HNSW-8A2BE2)](#)
+  [![WAL](https://img.shields.io/badge/crash--safe-WAL-blue)](#)
+  [![FTS5](https://img.shields.io/badge/hybrid-FTS5%20%2B%20Vector%20RRF-blue)](#)
+  [![PyO3](https://img.shields.io/badge/bindings-PyO3-yellow)](#)
+  [![Release Candidate](https://img.shields.io/badge/status-v0.1.0--RC1%20Ready-brightgreen)](#)
+</div>
 
 A local, durable long-term memory (LTM) runtime and single-machine vector engine for AI agents. No cloud databases, no network latency, no external daemons. Rust core with PyO3 Python bindings.
 
