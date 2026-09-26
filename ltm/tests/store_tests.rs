@@ -447,3 +447,120 @@ fn test_remember_batch_and_forget_batch() {
         .unwrap();
     assert_eq!(recall_after.items.len(), 2);
 }
+
+#[test]
+fn test_kv_metadata_filtering_in_recall() {
+    let dir = tempdir().unwrap();
+    let config = MemoryConfig::builder(dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = MemoryStore::open(config).unwrap();
+    let scope = MemoryScope::new("acme", "projects").unwrap();
+
+    // Insert 5 records with metadata: {"project": "alpha"}
+    for i in 0..5 {
+        let mut meta = HashMap::new();
+        meta.insert("project".to_string(), serde_json::Value::String("alpha".to_string()));
+        meta.insert("env".to_string(), serde_json::Value::String("prod".to_string()));
+
+        store
+            .remember(RememberRequest {
+                operation_id: None,
+                scope: scope.clone(),
+                content: format!("Alpha record {}", i),
+                embedding: vec![1.0, 0.0, 0.0],
+                kind: MemoryKind::Fact,
+                importance: 0.8,
+                expires_at_ms: None,
+                metadata: meta,
+                source: HashMap::new(),
+            })
+            .unwrap();
+    }
+
+    // Insert 5 records with metadata: {"project": "beta"}
+    for i in 0..5 {
+        let mut meta = HashMap::new();
+        meta.insert("project".to_string(), serde_json::Value::String("beta".to_string()));
+        meta.insert("env".to_string(), serde_json::Value::String("staging".to_string()));
+
+        store
+            .remember(RememberRequest {
+                operation_id: None,
+                scope: scope.clone(),
+                content: format!("Beta record {}", i),
+                embedding: vec![1.0, 0.0, 0.0],
+                kind: MemoryKind::Fact,
+                importance: 0.8,
+                expires_at_ms: None,
+                metadata: meta,
+                source: HashMap::new(),
+            })
+            .unwrap();
+    }
+
+    // Recall with filter: project == "alpha"
+    let filter_alpha = MemoryFilter::default().with_metadata_eq("project", "alpha");
+    let recall_alpha = store
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
+            limit: 10,
+            filters: filter_alpha,
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+
+    assert_eq!(recall_alpha.items.len(), 5);
+    for item in recall_alpha.items {
+        assert!(item.memory.content.contains("Alpha"));
+        assert_eq!(
+            item.memory.metadata.get("project"),
+            Some(&serde_json::Value::String("alpha".to_string()))
+        );
+    }
+
+    // Recall with hybrid FTS text search + filter: project == "beta"
+    let filter_beta = MemoryFilter::default().with_metadata_eq("project", "beta");
+    let recall_beta = store
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: Some("Beta".to_string()),
+            limit: 10,
+            filters: filter_beta,
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+
+    assert_eq!(recall_beta.items.len(), 5);
+    for item in recall_beta.items {
+        assert!(item.memory.content.contains("Beta"));
+        assert_eq!(
+            item.memory.metadata.get("project"),
+            Some(&serde_json::Value::String("beta".to_string()))
+        );
+    }
+
+    // Recall with non-matching metadata filter (project == "gamma") returns 0 items
+    let filter_gamma = MemoryFilter::default().with_metadata_eq("project", "gamma");
+    let recall_gamma = store
+        .recall(RecallRequest {
+            scope,
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
+            limit: 10,
+            filters: filter_gamma,
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+
+    assert_eq!(recall_gamma.items.len(), 0);
+}

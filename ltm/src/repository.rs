@@ -1,5 +1,5 @@
 use crate::error::{ErrorCode, MemoryError, Result};
-use crate::model::{MemoryKind, MemoryRecord, MemoryStatus};
+use crate::model::{MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus};
 use crate::namespace::MemoryScope;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1133,6 +1133,7 @@ impl Repository {
         &self,
         scope: &MemoryScope,
         query_text: &str,
+        filter: &MemoryFilter,
         limit: usize,
     ) -> Result<Vec<String>> {
         let sanitized = sanitize_fts_query(query_text);
@@ -1140,10 +1141,8 @@ impl Repository {
             return Ok(Vec::new());
         }
 
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                r#"
+        let mut query_sql = String::from(
+            r#"
             SELECT f.id
             FROM memories_fts f
             JOIN memories m ON f.id = m.id
@@ -1151,25 +1150,48 @@ impl Repository {
               AND f.namespace = ?
               AND f.memories_fts MATCH ?
               AND m.status = 'active'
-            ORDER BY rank
-            LIMIT ?
             "#,
-            )
-            .map_err(|e| MemoryError::DatabaseError {
-                code: ErrorCode::DatabaseError,
-                message: format!("Failed to prepare FTS query: {}", e),
-            })?;
+        );
 
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(scope.tenant_id().to_string()),
+            Box::new(scope.namespace().to_string()),
+            Box::new(sanitized),
+        ];
+
+        if let Some(ref meta) = filter.metadata_eq {
+            for (key, val) in meta {
+                query_sql.push_str(" AND json_extract(m.metadata_json, ?) = ?");
+                params_vec.push(Box::new(format!("$.{}", key)));
+                match val {
+                    serde_json::Value::String(s) => params_vec.push(Box::new(s.clone())),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            params_vec.push(Box::new(i));
+                        } else if let Some(f) = n.as_f64() {
+                            params_vec.push(Box::new(f));
+                        } else {
+                            params_vec.push(Box::new(val.to_string()));
+                        }
+                    }
+                    serde_json::Value::Bool(b) => params_vec.push(Box::new(if *b { 1i64 } else { 0i64 })),
+                    _ => params_vec.push(Box::new(val.to_string())),
+                }
+            }
+        }
+
+        query_sql.push_str(" ORDER BY rank LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&query_sql).map_err(|e| MemoryError::DatabaseError {
+            code: ErrorCode::DatabaseError,
+            message: format!("Failed to prepare FTS query: {}", e),
+        })?;
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(
-                params![
-                    scope.tenant_id(),
-                    scope.namespace(),
-                    sanitized,
-                    limit as i64,
-                ],
-                |row| row.get(0),
-            )
+            .query_map(&param_refs[..], |row| row.get(0))
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
                 message: format!("FTS query failed: {}", e),
@@ -1408,16 +1430,16 @@ mod tests {
         repo.set_status("mem-fts-2", MemoryStatus::Active).unwrap();
 
         // Search scope_a for "Quantum silicon"
-        let matches_a = repo.search_fts(&scope_a, "Quantum silicon", 10).unwrap();
+        let matches_a = repo.search_fts(&scope_a, "Quantum silicon", &MemoryFilter::default(), 10).unwrap();
         assert_eq!(matches_a, vec!["mem-fts-1"]);
 
         // Search scope_b for "Quantum silicon"
-        let matches_b = repo.search_fts(&scope_b, "Quantum silicon", 10).unwrap();
+        let matches_b = repo.search_fts(&scope_b, "Quantum silicon", &MemoryFilter::default(), 10).unwrap();
         assert_eq!(matches_b, vec!["mem-fts-2"]);
 
         // Tombstone mem-fts-1 and verify FTS search omits deleted
         repo.delete_memory(&scope_a, "mem-fts-1", None, 200).unwrap();
-        let matches_after_del = repo.search_fts(&scope_a, "Quantum silicon", 10).unwrap();
+        let matches_after_del = repo.search_fts(&scope_a, "Quantum silicon", &MemoryFilter::default(), 10).unwrap();
         assert!(matches_after_del.is_empty());
     }
 }

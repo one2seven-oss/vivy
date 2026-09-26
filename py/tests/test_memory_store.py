@@ -229,3 +229,67 @@ def test_memory_store_batch_operations():
         )
         assert len(results_after) == 6
 
+
+def test_memory_store_filter_metadata():
+    """Verify metadata dictionary filtering in MemoryStore.recall()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = vivy.MemoryStore.open(tmpdir, 3, "test-model")
+
+        store.remember(
+            tenant_id="acme",
+            namespace="support",
+            content="Alpha project memory",
+            embedding=[1.0, 0.0, 0.0],
+            kind="fact",
+            metadata={"project": "alpha", "session_id": 42, "confidential": True}
+        )
+
+        store.remember(
+            tenant_id="acme",
+            namespace="support",
+            content="Beta project memory",
+            embedding=[1.0, 0.0, 0.0],
+            kind="fact",
+            metadata={"project": "beta", "session_id": 99, "confidential": False}
+        )
+
+        # Filter by project == "alpha"
+        alpha_res = store.recall(
+            tenant_id="acme",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            filter_metadata={"project": "alpha"}
+        )
+        assert len(alpha_res) == 1
+        assert alpha_res[0][1] == "Alpha project memory"
+
+        # Filter by int metadata session_id == 99
+        beta_res = store.recall(
+            tenant_id="acme",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            filter_metadata={"session_id": 99}
+        )
+        assert len(beta_res) == 1
+        assert beta_res[0][1] == "Beta project memory"
+
+        # Filter by boolean metadata confidential == True
+        conf_res = store.recall(
+            tenant_id="acme",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            filter_metadata={"confidential": True}
+        )
+        assert len(conf_res) == 1
+        assert conf_res[0][1] == "Alpha project memory"
+
+        # Filter with non-matching metadata
+        none_res = store.recall(
+            tenant_id="acme",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            filter_metadata={"project": "gamma"}
+        )
+        assert len(none_res) == 0
+
+

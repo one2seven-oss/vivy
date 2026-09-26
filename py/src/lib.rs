@@ -3,14 +3,13 @@
 //! Key decisions:
 //! - `allow_threads()` releases the GIL on every insert/search so Python
 //!   threads can do data loading while Rust handles vector search.
-//! - Currently accepts `Vec<f32>` from Python. Large arrays should use
-//!   the buffer protocol (NumPy `__array_interface__`) — next optimisation.
-//! - Metadata dicts → `Vec<(String, String)>`. Simplistic: all values are
-//!   strings, filters are strict equality. A richer type system needs a
-//!   more expressive Rust-side filter DSL first.
-//! - Filter dicts are always AND-combined. The flat dict form is ergonomic
-//!   for the common case (`color=red AND year=2024`).
+//! - Direct PyO3 NumPy buffer protocol support (`PyReadonlyArray1<f32>`) enables
+//!   zero-copy slice passing from `np.ndarray` and PyTorch tensors.
+//! - Metadata dicts → `Vec<(String, String)>` for low-level index filters, and
+//!   `HashMap<String, serde_json::Value>` for dynamic key-value filtering in `MemoryStore.recall()`.
+//! - Filter dicts are AND-combined.
 
+use std::collections::HashMap;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -26,24 +25,20 @@ enum PyVectorInput<'py> {
 
 impl<'py> PyVectorInput<'py> {
     fn extract(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if obj.is_instance_of::<pyo3::types::PyList>() {
-            if let Ok(list) = obj.extract::<Vec<f32>>() {
-                return Ok(PyVectorInput::List(list));
-            }
-        }
         if let Ok(arr) = obj.extract::<PyReadonlyArray1<'py, f32>>() {
             if arr.as_slice().is_ok() {
-                Ok(PyVectorInput::NumPy(arr))
-            } else {
-                Err(PyValueError::new_err(
-                    "numpy array must be a contiguous 1D array with dtype=float32",
-                ))
+                return Ok(PyVectorInput::NumPy(arr));
             }
-        } else if obj.hasattr("__array_interface__")? {
-            Err(PyTypeError::new_err(
+            return Err(PyValueError::new_err(
+                "numpy array must be a contiguous 1D array with dtype=float32",
+            ));
+        }
+        if obj.hasattr("__array_interface__")? {
+            return Err(PyTypeError::new_err(
                 "vector must be a list of floats or a contiguous 1D numpy array with dtype=float32",
-            ))
-        } else if let Ok(list) = obj.extract::<Vec<f32>>() {
+            ));
+        }
+        if let Ok(list) = obj.extract::<Vec<f32>>() {
             Ok(PyVectorInput::List(list))
         } else {
             Err(PyTypeError::new_err(
@@ -120,20 +115,13 @@ impl Index {
         vectors: Bound<'_, PyAny>,
         metadata: Option<Vec<Option<Bound<'_, PyDict>>>>,
     ) -> PyResult<Vec<u64>> {
-        let metas = match metadata {
-            Some(list) => {
-                let mut parsed = Vec::with_capacity(list.len());
-                for item in list {
-                    let m = match item {
-                        Some(ref d) => parse_metadata(Some(d))?,
-                        None => Vec::new(),
-                    };
-                    parsed.push(m);
-                }
-                Some(parsed)
-            }
-            None => None,
-        };
+        let metas = metadata
+            .map(|list| {
+                list.into_iter()
+                    .map(|item| parse_metadata(item.as_ref()))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
 
         let parsed_vectors: Vec<Vec<f32>> = if let Ok(arr2) = vectors.extract::<numpy::PyReadonlyArray2<'_, f32>>() {
             let slice2 = arr2.as_array();
@@ -186,13 +174,11 @@ impl Index {
         Ok(results)
     }
 
-    // Delta segment count (excludes sealed — approximate "recent inserts").
     fn __len__(&self) -> usize {
         self.inner.delta_len()
     }
 }
 
-// Python dict → Vec<(String, String)>. All values coerced to string. None/empty = no-op.
 fn parse_metadata(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, String)>> {
     let Some(d) = dict else { return Ok(Vec::new()) };
     let mut meta = Vec::with_capacity(d.len());
@@ -204,7 +190,6 @@ fn parse_metadata(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Str
     Ok(meta)
 }
 
-// Python dict → Option<FilterExpr>. AND-combined. Single pair = no And wrapper. None/empty = None.
 fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>> {
     let Some(d) = dict else { return Ok(None) };
     let mut exprs = Vec::new();
@@ -225,6 +210,51 @@ fn parse_filter(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<FilterExpr>
         1 => Ok(Some(exprs.into_iter().next().unwrap())),
         _ => Ok(Some(FilterExpr::And(exprs))),
     }
+}
+
+fn py_any_to_json_val(val: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if let Ok(b) = val.extract::<bool>() {
+        Ok(serde_json::Value::Bool(b))
+    } else if let Ok(i) = val.extract::<i64>() {
+        Ok(serde_json::Value::Number(i.into()))
+    } else if let Ok(f) = val.extract::<f64>() {
+        serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| PyValueError::new_err("invalid float value in metadata"))
+    } else if let Ok(s) = val.extract::<String>() {
+        Ok(serde_json::Value::String(s))
+    } else {
+        Err(PyTypeError::new_err(
+            "metadata values must be strings, ints, floats, or bools",
+        ))
+    }
+}
+
+fn parse_py_dict_metadata(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, serde_json::Value>> {
+    let mut map = HashMap::with_capacity(dict.len());
+    for (k, v) in dict.iter() {
+        let key: String = k.extract()?;
+        let val = py_any_to_json_val(&v)?;
+        map.insert(key, val);
+    }
+    Ok(map)
+}
+
+fn parse_scope(
+    tenant_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    user_id: Option<&str>,
+) -> PyResult<vivy_memory::MemoryScope> {
+    let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    if let Some(agent) = agent_id {
+        scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
+    if let Some(user) = user_id {
+        scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
+    Ok(scope)
 }
 
 // Python facade for vivy_memory::MemoryStore
@@ -259,7 +289,7 @@ impl PyMemoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (tenant_id, namespace, content, embedding, kind="fact", importance=0.5, agent_id=None, user_id=None, operation_id=None, expires_at_ms=None))]
+    #[pyo3(signature = (tenant_id, namespace, content, embedding, kind="fact", importance=0.5, agent_id=None, user_id=None, operation_id=None, expires_at_ms=None, metadata=None))]
     fn remember(
         &self,
         py: Python<'_>,
@@ -273,15 +303,9 @@ impl PyMemoryStore {
         user_id: Option<&str>,
         operation_id: Option<String>,
         expires_at_ms: Option<i64>,
+        metadata: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<String> {
-        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if let Some(agent) = agent_id {
-            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
-        if let Some(user) = user_id {
-            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
+        let scope = parse_scope(tenant_id, namespace, agent_id, user_id)?;
 
         let m_kind = match kind.to_lowercase().as_str() {
             "preference" => vivy_memory::MemoryKind::Preference,
@@ -293,6 +317,7 @@ impl PyMemoryStore {
 
         let vec_input = PyVectorInput::extract(&embedding)?;
         let vec_data = vec_input.into_vec()?;
+        let meta_map = metadata.map(parse_py_dict_metadata).transpose()?.unwrap_or_default();
 
         let req = vivy_memory::RememberRequest {
             operation_id,
@@ -302,8 +327,8 @@ impl PyMemoryStore {
             kind: m_kind,
             importance,
             expires_at_ms,
-            metadata: std::collections::HashMap::new(),
-            source: std::collections::HashMap::new(),
+            metadata: meta_map,
+            source: HashMap::new(),
         };
 
         let store = self.inner.clone();
@@ -371,14 +396,15 @@ impl PyMemoryStore {
                 None => None,
             };
 
-            let mut scope = vivy_memory::MemoryScope::new(&tenant_id, &namespace)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            if let Some(ref agent) = agent_id {
-                scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            }
-            if let Some(ref user) = user_id {
-                scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            }
+            let metadata_map = match dict.get_item("metadata")? {
+                Some(meta_dict) => match meta_dict.downcast::<PyDict>() {
+                    Ok(d) => parse_py_dict_metadata(d)?,
+                    Err(_) => HashMap::new(),
+                },
+                None => HashMap::new(),
+            };
+
+            let scope = parse_scope(&tenant_id, &namespace, agent_id.as_deref(), user_id.as_deref())?;
 
             let m_kind = match kind_str.as_deref().unwrap_or("fact").to_lowercase().as_str() {
                 "preference" => vivy_memory::MemoryKind::Preference,
@@ -396,8 +422,8 @@ impl PyMemoryStore {
                 kind: m_kind,
                 importance,
                 expires_at_ms,
-                metadata: std::collections::HashMap::new(),
-                source: std::collections::HashMap::new(),
+                metadata: metadata_map,
+                source: HashMap::new(),
             });
         }
 
@@ -410,7 +436,7 @@ impl PyMemoryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (tenant_id, namespace, query_embedding, query_text=None, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None))]
+    #[pyo3(signature = (tenant_id, namespace, query_embedding, query_text=None, limit=5, agent_id=None, user_id=None, include_explanations=true, mmr_lambda=None, filter_metadata=None))]
     fn recall(
         &self,
         py: Python<'_>,
@@ -423,25 +449,24 @@ impl PyMemoryStore {
         user_id: Option<&str>,
         include_explanations: bool,
         mmr_lambda: Option<f32>,
+        filter_metadata: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<(String, String, f32)>> {
-        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if let Some(agent) = agent_id {
-            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
-        if let Some(user) = user_id {
-            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
+        let scope = parse_scope(tenant_id, namespace, agent_id, user_id)?;
 
         let vec_input = PyVectorInput::extract(&query_embedding)?;
         let query_vec = vec_input.into_vec()?;
+
+        let filters = vivy_memory::MemoryFilter {
+            metadata_eq: filter_metadata.map(parse_py_dict_metadata).transpose()?,
+            ..Default::default()
+        };
 
         let req = vivy_memory::RecallRequest {
             scope,
             query_embedding: query_vec,
             query_text,
             limit,
-            filters: vivy_memory::MemoryFilter::default(),
+            filters,
             include_explanations,
             mmr_lambda,
         };
@@ -472,14 +497,7 @@ impl PyMemoryStore {
         agent_id: Option<&str>,
         user_id: Option<&str>,
     ) -> PyResult<Option<PyObject>> {
-        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if let Some(agent) = agent_id {
-            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
-        if let Some(user) = user_id {
-            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
+        let scope = parse_scope(tenant_id, namespace, agent_id, user_id)?;
 
         let store = self.inner.clone();
         let record = py.allow_threads(move || {
@@ -524,14 +542,7 @@ impl PyMemoryStore {
         operation_id: Option<String>,
         expires_at_ms: Option<i64>,
     ) -> PyResult<()> {
-        let mut scope = vivy_memory::MemoryScope::new(tenant_id, namespace)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if let Some(agent) = agent_id {
-            scope = scope.with_agent(agent).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
-        if let Some(user) = user_id {
-            scope = scope.with_user(user).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        }
+        let scope = parse_scope(tenant_id, namespace, agent_id, user_id)?;
 
         let m_kind = match kind {
             Some(k) => match k.to_lowercase().as_str() {

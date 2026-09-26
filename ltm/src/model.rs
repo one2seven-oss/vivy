@@ -128,6 +128,13 @@ impl MemoryFilter {
         self.min_importance = Some(min_importance);
         self
     }
+
+    pub fn with_metadata_eq(mut self, key: impl Into<String>, val: impl Into<serde_json::Value>) -> Self {
+        let mut map = self.metadata_eq.unwrap_or_default();
+        map.insert(key.into(), val.into());
+        self.metadata_eq = Some(map);
+        self
+    }
 }
 
 /// Request to update an existing memory record with optimistic revision concurrency.

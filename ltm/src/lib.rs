@@ -172,7 +172,7 @@ impl MemoryStore {
             .search(&req.query_embedding, candidate_limit)?;
 
         let fts_candidate_ids = if let Some(ref text) = req.query_text {
-            self.repo.search_fts(&req.scope, text, candidate_limit)?
+            self.repo.search_fts(&req.scope, text, &req.filters, candidate_limit)?
         } else {
             Vec::new()
         };
@@ -229,6 +229,22 @@ impl MemoryStore {
 
                 if let Some(min_imp) = req.filters.min_importance {
                     if record.importance < min_imp {
+                        continue;
+                    }
+                }
+
+                if let Some(ref meta_filter) = req.filters.metadata_eq {
+                    let mut matches = true;
+                    for (k, expected_val) in meta_filter {
+                        match record.metadata.get(k) {
+                            Some(actual_val) if actual_val == expected_val => continue,
+                            _ => {
+                                matches = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !matches {
                         continue;
                     }
                 }
