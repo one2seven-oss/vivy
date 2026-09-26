@@ -487,6 +487,60 @@ impl PyMemoryStore {
         Ok(results)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (tenant_id, namespace, query_embedding, query_text=None, max_tokens=1500, limit=10, template=None, header=None, footer=None, agent_id=None, user_id=None, filter_metadata=None))]
+    fn format_context(
+        &self,
+        py: Python<'_>,
+        tenant_id: &str,
+        namespace: &str,
+        query_embedding: Bound<'_, PyAny>,
+        query_text: Option<String>,
+        max_tokens: usize,
+        limit: usize,
+        template: Option<String>,
+        header: Option<String>,
+        footer: Option<String>,
+        agent_id: Option<&str>,
+        user_id: Option<&str>,
+        filter_metadata: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
+        let scope = parse_scope(tenant_id, namespace, agent_id, user_id)?;
+
+        let vec_input = PyVectorInput::extract(&query_embedding)?;
+        let query_vec = vec_input.into_vec()?;
+
+        let filters = vivy_memory::MemoryFilter {
+            metadata_eq: filter_metadata.map(parse_py_dict_metadata).transpose()?,
+            ..Default::default()
+        };
+
+        let req = vivy_memory::RecallRequest {
+            scope,
+            query_embedding: query_vec,
+            query_text,
+            limit,
+            filters,
+            include_explanations: false,
+            mmr_lambda: Some(0.5),
+        };
+
+        let default_options = vivy_memory::ContextFormatOptions::default();
+        let options = vivy_memory::ContextFormatOptions {
+            max_tokens,
+            template: template.unwrap_or(default_options.template),
+            header: header.or(default_options.header),
+            footer: footer.or(default_options.footer),
+        };
+
+        let store = self.inner.clone();
+        py.allow_threads(move || {
+            store
+                .format_context(req, options)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(signature = (tenant_id, namespace, id, agent_id=None, user_id=None))]
     fn get(
         &self,

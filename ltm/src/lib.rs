@@ -15,8 +15,8 @@ pub use error::{ErrorCode, MemoryError, Result};
 pub use health::StoreHealth;
 pub use index_adapter::{InMemoryTestIndex, VectorIndex, VivyVectorIndex};
 pub use model::{
-    ForgetRequest, MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus, RecallExplanation,
-    RecallItem, RecallRequest, RecallResponse, RememberRequest, UpdateRequest,
+    ContextFormatOptions, ForgetRequest, MemoryFilter, MemoryKind, MemoryRecord, MemoryStatus,
+    RecallExplanation, RecallItem, RecallRequest, RecallResponse, RememberRequest, UpdateRequest,
 };
 pub use namespace::MemoryScope;
 pub use repository::Repository;
@@ -465,4 +465,61 @@ impl MemoryStore {
         let active_records = self.repo.get_all_active_records()?;
         self.index.rebuild(Box::new(active_records.iter()))
     }
+
+    /// Retrieve and format memories into a token-budgeted string for LLM context injection.
+    pub fn format_context(
+        &self,
+        req: RecallRequest,
+        options: ContextFormatOptions,
+    ) -> Result<String> {
+        options.validate()?;
+        let response = self.recall(req)?;
+        let mut output = String::new();
+
+        if let Some(ref header) = options.header {
+            if !header.is_empty() {
+                output.push_str(header);
+                output.push('\n');
+            }
+        }
+
+        let mut current_token_estimate = estimate_tokens(&output);
+
+        for item in response.items {
+            let kind_str = format!("{:?}", item.memory.kind).to_lowercase();
+            let line = options
+                .template
+                .replace("{kind}", &kind_str)
+                .replace("{content}", &item.memory.content)
+                .replace("{score:.2}", &format!("{:.2}", item.score))
+                .replace("{score}", &format!("{:.4}", item.score));
+
+            let line_tokens = estimate_tokens(&line);
+            if current_token_estimate + line_tokens > options.max_tokens {
+                break;
+            }
+
+            output.push_str(&line);
+            output.push('\n');
+            current_token_estimate += line_tokens;
+        }
+
+        if let Some(ref footer) = options.footer {
+            if !footer.is_empty() {
+                let footer_tokens = estimate_tokens(footer);
+                if current_token_estimate + footer_tokens <= options.max_tokens {
+                    output.push_str(footer);
+                }
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    (text.len() as f32 / 4.0).ceil() as usize
 }

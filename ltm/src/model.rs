@@ -265,3 +265,32 @@ pub struct RecallResponse {
     pub items: Vec<RecallItem>,
     pub total_candidates: usize,
 }
+
+/// Configuration options for LLM context formatting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextFormatOptions {
+    pub max_tokens: usize,
+    pub template: String,
+    pub header: Option<String>,
+    pub footer: Option<String>,
+}
+
+impl Default for ContextFormatOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: 1500,
+            template: "- [{kind}] {content} (score: {score:.2})".to_string(),
+            header: Some("### Relevant Agent Memories:".to_string()),
+            footer: None,
+        }
+    }
+}
+
+impl ContextFormatOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_tokens == 0 {
+            return Err(MemoryError::invalid_input("max_tokens must be greater than 0"));
+        }
+        Ok(())
+    }
+}

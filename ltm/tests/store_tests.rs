@@ -564,3 +564,108 @@ fn test_kv_metadata_filtering_in_recall() {
 
     assert_eq!(recall_gamma.items.len(), 0);
 }
+
+#[test]
+fn test_format_context_token_budget() {
+    let dir = tempdir().unwrap();
+    let config = MemoryConfig::builder(dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = MemoryStore::open(config).unwrap();
+    let scope = MemoryScope::new("acme", "context-test").unwrap();
+
+    // Insert 20 memories with long text
+    for i in 0..20 {
+        store
+            .remember(RememberRequest {
+                operation_id: None,
+                scope: scope.clone(),
+                content: format!("Long memory content record item number {} with detailed context information.", i),
+                embedding: vec![1.0, 0.0, 0.0],
+                kind: MemoryKind::Fact,
+                importance: 0.8,
+                expires_at_ms: None,
+                metadata: HashMap::new(),
+                source: HashMap::new(),
+            })
+            .unwrap();
+    }
+
+    let req = RecallRequest {
+        scope,
+        query_embedding: vec![1.0, 0.0, 0.0],
+        query_text: None,
+        limit: 20,
+        filters: MemoryFilter::default(),
+        include_explanations: false,
+        mmr_lambda: None,
+    };
+
+    let options = ContextFormatOptions {
+        max_tokens: 100,
+        template: "- [{kind}] {content}".to_string(),
+        header: Some("### System Context:".to_string()),
+        footer: None,
+    };
+
+    let formatted = store.format_context(req, options).unwrap();
+
+    assert!(formatted.starts_with("### System Context:"));
+    // Heuristic: ~4 chars per token, so 100 tokens max ~400 chars
+    let token_estimate = (formatted.len() as f32 / 4.0).ceil() as usize;
+    assert!(token_estimate <= 100);
+    assert!(formatted.ends_with('\n'));
+}
+
+#[test]
+fn test_format_context_template_placeholders() {
+    let dir = tempdir().unwrap();
+    let config = MemoryConfig::builder(dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = MemoryStore::open(config).unwrap();
+    let scope = MemoryScope::new("acme", "template-test").unwrap();
+
+    store
+        .remember(RememberRequest {
+            operation_id: None,
+            scope: scope.clone(),
+            content: "User prefers dark mode UI theme.".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            kind: MemoryKind::Preference,
+            importance: 0.9,
+            expires_at_ms: None,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        })
+        .unwrap();
+
+    let req = RecallRequest {
+        scope,
+        query_embedding: vec![1.0, 0.0, 0.0],
+        query_text: None,
+        limit: 5,
+        filters: MemoryFilter::default(),
+        include_explanations: false,
+        mmr_lambda: None,
+    };
+
+    let options = ContextFormatOptions {
+        max_tokens: 500,
+        template: "* [{kind}] {content} (relevance: {score:.2})".to_string(),
+        header: Some("=== MEMORY CONTEXT ===".to_string()),
+        footer: Some("=== END CONTEXT ===".to_string()),
+    };
+
+    let formatted = store.format_context(req, options).unwrap();
+
+    assert!(formatted.contains("=== MEMORY CONTEXT ==="));
+    assert!(formatted.contains("* [preference] User prefers dark mode UI theme. (relevance:"));
+    assert!(formatted.contains("=== END CONTEXT ==="));
+}

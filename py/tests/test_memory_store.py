@@ -293,3 +293,62 @@ def test_memory_store_filter_metadata():
         assert len(none_res) == 0
 
 
+def test_memory_store_format_context():
+    """Verify PyMemoryStore.format_context() string formatting and filtering options."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = vivy.MemoryStore.open(tmpdir, 3, "test-model")
+
+        store.remember(
+            tenant_id="tenant-ctx",
+            namespace="support",
+            content="Alpha context memory block",
+            embedding=[1.0, 0.0, 0.0],
+            kind="fact",
+            metadata={"source": "user"}
+        )
+
+        store.remember(
+            tenant_id="tenant-ctx",
+            namespace="support",
+            content="Beta context memory block",
+            embedding=[0.9, 0.1, 0.0],
+            kind="rule",
+            metadata={"source": "system"}
+        )
+
+        # Basic context formatting with default settings
+        formatted = store.format_context(
+            tenant_id="tenant-ctx",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0]
+        )
+        assert "Alpha context memory block" in formatted
+        assert "Beta context memory block" in formatted
+
+        # Custom header, footer, template, and metadata filtering
+        custom_fmt = store.format_context(
+            tenant_id="tenant-ctx",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            header="=== CONTEXT START ===",
+            footer="=== CONTEXT END ===",
+            template="[{kind}] {content}",
+            filter_metadata={"source": "user"}
+        )
+        assert custom_fmt.startswith("=== CONTEXT START ===")
+        assert custom_fmt.endswith("=== CONTEXT END ===")
+        assert "[fact] Alpha context memory block" in custom_fmt
+        assert "Beta context memory block" not in custom_fmt
+
+        # Token budget constraint
+        short_fmt = store.format_context(
+            tenant_id="tenant-ctx",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0],
+            max_tokens=10
+        )
+        # Should truncate to at most 1 item due to low max_tokens
+        assert short_fmt.count("context memory block") <= 1
+
+
+
