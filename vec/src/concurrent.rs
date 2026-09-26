@@ -385,6 +385,36 @@ impl VivyIndex {
             }
         }
     }
+
+    /// Flush any pending delta vectors to disk and copy all sealed vector segments (.vivy) and manifest (.idx) to target_dir.
+    pub fn flush_and_copy_segments(&self, target_dir: &Path) -> Result<(), VivyError> {
+        if !target_dir.exists() {
+            std::fs::create_dir_all(target_dir).map_err(|e| VivyError::Wal(WalError::Io(e)))?;
+        }
+        if let Some(ref dir) = self.data_dir {
+            self.compact_now();
+            if dir.exists() {
+                let manifest_src = Manifest::manifest_path(dir);
+                if manifest_src.exists() {
+                    let manifest_dst = Manifest::manifest_path(target_dir);
+                    std::fs::copy(&manifest_src, &manifest_dst).map_err(|e| VivyError::Wal(WalError::Io(e)))?;
+                }
+
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("vivy") {
+                            if let Some(fname) = path.file_name() {
+                                let dst = target_dir.join(fname);
+                                std::fs::copy(&path, &dst).map_err(|e| VivyError::Wal(WalError::Io(e)))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for VivyIndex {

@@ -134,6 +134,22 @@ impl Repository {
         Ok(repo)
     }
 
+    /// Perform a crash-consistent online backup of the SQLite database using VACUUM INTO.
+    pub fn backup_sqlite(&self, target_db_path: &Path) -> Result<()> {
+        let conn = self.conn.lock();
+        let path_str = target_db_path.to_str().ok_or_else(|| MemoryError::InvalidInput {
+            code: ErrorCode::InvalidInput,
+            message: "invalid target backup path".to_string(),
+        })?;
+
+        conn.execute("VACUUM INTO ?", params![path_str])
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("SQLite VACUUM INTO failed: {}", e),
+            })?;
+        Ok(())
+    }
+
     pub fn migrate(&self) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(|e| MemoryError::DatabaseError {

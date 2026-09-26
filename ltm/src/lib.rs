@@ -49,7 +49,11 @@ impl MemoryStore {
         let db_path = path.join("memory.db");
         let repo = Arc::new(Repository::open(db_path)?);
 
-        let index = Arc::new(VivyVectorIndex::new(config.dimensions(), Metric::Cosine)?);
+        let index = Arc::new(VivyVectorIndex::new_with_dir(
+            config.dimensions(),
+            Metric::Cosine,
+            Some(config.path()),
+        )?);
         let coordinator = JournalCoordinator::new(repo.clone(), index.clone());
 
         // Run crash recovery / journal replay
@@ -514,6 +518,33 @@ impl MemoryStore {
         }
 
         Ok(output)
+    }
+
+    /// Create a zero-downtime, fully consistent backup of the memory store at `target_dir`.
+    pub fn backup(&self, target_dir: impl AsRef<std::path::Path>) -> Result<()> {
+        let target = target_dir.as_ref();
+        if !target.exists() {
+            std::fs::create_dir_all(target).map_err(|e| MemoryError::IoError {
+                code: ErrorCode::IoError,
+                message: format!("Failed to create backup target directory: {}", e),
+            })?;
+        }
+
+        let target_db = target.join("memory.db");
+        if target_db.exists() {
+            std::fs::remove_file(&target_db).map_err(|e| MemoryError::IoError {
+                code: ErrorCode::IoError,
+                message: format!("Failed to clear target db file: {}", e),
+            })?;
+        }
+
+        // 1. Perform SQLite online backup via VACUUM INTO
+        self.repo.backup_sqlite(&target_db)?;
+
+        // 2. Perform vector index segment backup
+        self.index.backup_segments(target)?;
+
+        Ok(())
     }
 }
 

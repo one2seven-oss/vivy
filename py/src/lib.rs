@@ -541,6 +541,18 @@ impl PyMemoryStore {
         })
     }
 
+    #[pyo3(signature = (target_path))]
+    fn backup(&self, py: Python<'_>, target_path: &str) -> PyResult<()> {
+        let store = self.inner.clone();
+        let path = target_path.to_string();
+
+        py.allow_threads(move || {
+            store
+                .backup(&path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(signature = (tenant_id, namespace, id, agent_id=None, user_id=None))]
     fn get(
         &self,

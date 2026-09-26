@@ -39,6 +39,11 @@ pub trait VectorIndex: Send + Sync {
         }
         Ok(())
     }
+
+    /// Flush and copy vector segments and manifest to target directory.
+    fn backup_segments(&self, _target_dir: &std::path::Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Vivy-backed implementation of VectorIndex.
@@ -55,7 +60,16 @@ pub struct VivyVectorIndex {
 
 impl VivyVectorIndex {
     pub fn new(dims: usize, metric: Metric) -> Result<Self> {
-        let vivy_idx = VivyIndex::new(dims, metric, None::<&str>, None::<&str>)
+        Self::new_with_dir(dims, metric, Option::<&std::path::Path>::None)
+    }
+
+    pub fn new_with_dir(
+        dims: usize,
+        metric: Metric,
+        data_dir: Option<impl AsRef<std::path::Path>>,
+    ) -> Result<Self> {
+        let wal_path = data_dir.as_ref().map(|p| p.as_ref().join("index.wal"));
+        let vivy_idx = VivyIndex::new(dims, metric, wal_path, data_dir)
             .map_err(|e| MemoryError::DatabaseError {
                 code: ErrorCode::DatabaseError,
                 message: format!("Failed to create VivyIndex: {:?}", e),
@@ -250,6 +264,16 @@ impl VectorIndex for VivyVectorIndex {
 
     fn is_healthy(&self) -> bool {
         true
+    }
+
+    fn backup_segments(&self, target_dir: &std::path::Path) -> Result<()> {
+        let idx = self.index.read();
+        idx.flush_and_copy_segments(target_dir)
+            .map_err(|e| MemoryError::DatabaseError {
+                code: ErrorCode::DatabaseError,
+                message: format!("Vector segment backup failed: {:?}", e),
+            })?;
+        Ok(())
     }
 }
 

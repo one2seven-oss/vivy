@@ -351,4 +351,41 @@ def test_memory_store_format_context():
         assert short_fmt.count("context memory block") <= 1
 
 
+def test_memory_store_backup():
+    """Verify MemoryStore.backup() produces a functional independent store snapshot."""
+    with tempfile.TemporaryDirectory() as primary_dir, tempfile.TemporaryDirectory() as backup_dir:
+        store = vivy.MemoryStore.open(primary_dir, 3, "test-model")
+
+        mem_id = store.remember(
+            tenant_id="acme",
+            namespace="support",
+            content="Observation before backup snapshot",
+            embedding=[1.0, 0.0, 0.0],
+            kind="fact"
+        )
+
+        # Create backup snapshot
+        store.backup(backup_dir)
+
+        # Open backed-up store
+        restored = vivy.MemoryStore.open(backup_dir, 3, "test-model")
+
+        health = restored.health()
+        assert health["is_healthy"] is True
+        assert health["total_active_records"] == 1
+
+        rec = restored.get("acme", "support", mem_id)
+        assert rec is not None
+        assert rec["content"] == "Observation before backup snapshot"
+
+        recalled = restored.recall(
+            tenant_id="acme",
+            namespace="support",
+            query_embedding=[1.0, 0.0, 0.0]
+        )
+        assert len(recalled) == 1
+        assert recalled[0][0] == mem_id
+
+
+
 

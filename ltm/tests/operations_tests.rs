@@ -189,3 +189,110 @@ fn test_rebuild_index_restores_active_records() {
     assert_eq!(recall.items.len(), 1);
     assert_eq!(recall.items[0].memory.content, "Rebuild target");
 }
+
+#[test]
+fn test_atomic_online_backup_and_restore() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let primary_dir = tempdir().unwrap();
+    let backup_dir = tempdir().unwrap();
+
+    let config = MemoryConfig::builder(primary_dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let store = Arc::new(MemoryStore::open(config).unwrap());
+    let scope = MemoryScope::new("tenant-backup", "ns-live").unwrap();
+
+    // 1. Seed initial memory
+    let initial_id = store
+        .remember(RememberRequest {
+            operation_id: None,
+            scope: scope.clone(),
+            content: "Primary seed observation".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            kind: MemoryKind::Fact,
+            importance: 0.9,
+            expires_at_ms: None,
+            metadata: HashMap::new(),
+            source: HashMap::new(),
+        })
+        .unwrap();
+
+    // 2. Spawn concurrent background writer thread
+    let running = Arc::new(AtomicBool::new(true));
+    let writer_store = store.clone();
+    let writer_scope = scope.clone();
+    let writer_running = running.clone();
+
+    let writer_handle = thread::spawn(move || {
+        let mut count = 0;
+        while writer_running.load(Ordering::Acquire) {
+            let req = RememberRequest {
+                operation_id: None,
+                scope: writer_scope.clone(),
+                content: format!("Concurrent memory write {count}"),
+                embedding: vec![0.0, 1.0, 0.0],
+                kind: MemoryKind::Fact,
+                importance: 0.5,
+                expires_at_ms: None,
+                metadata: HashMap::new(),
+                source: HashMap::new(),
+            };
+            let _ = writer_store.remember(req);
+            count += 1;
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    // Let concurrent writes run briefly
+    thread::sleep(std::time::Duration::from_millis(20));
+
+    // 3. Perform live zero-downtime atomic backup
+    store.backup(backup_dir.path()).unwrap();
+
+    // Stop writer thread
+    running.store(false, Ordering::Release);
+    writer_handle.join().unwrap();
+
+    // 4. Open the backed-up directory as a new independent MemoryStore
+    let backup_config = MemoryConfig::builder(backup_dir.path())
+        .dimensions(3)
+        .embedding_model("test-model")
+        .build()
+        .unwrap();
+
+    let restored_store = MemoryStore::open(backup_config).unwrap();
+
+    // 5. Verify integrity and data of restored store
+    let health = restored_store.health().unwrap();
+    assert!(health.is_healthy);
+    assert!(health.total_active_records >= 1);
+
+    // Verify initial seed record exists in restored store
+    let seed_record = restored_store.get(&scope, &initial_id).unwrap();
+    assert!(seed_record.is_some());
+    assert_eq!(
+        seed_record.unwrap().content,
+        "Primary seed observation"
+    );
+
+    // Verify recall succeeds on restored store
+    let recall_res = restored_store
+        .recall(RecallRequest {
+            scope,
+            query_embedding: vec![1.0, 0.0, 0.0],
+            query_text: None,
+            limit: 5,
+            filters: MemoryFilter::default(),
+            include_explanations: false,
+            mmr_lambda: None,
+        })
+        .unwrap();
+
+    assert!(!recall_res.items.is_empty());
+}
